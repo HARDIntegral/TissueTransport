@@ -1,0 +1,75 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+
+# Build files
+build/
+dist/
+*.egg-info/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDEs
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+
+# Environment variables
+.env
+
+# NumPy / scientific outputs
+*.npy
+*.npz
+
+# Generated images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+
+# Simulation outputs
+outputs/
+results/
+data/generated/
+frames/
+animations/
+checkpoints/
+
+# Large datasets
+data/raw/
+*.csv
+*.h5
+*.hdf5
+
+# Progress bars/checkpoints
+*.pickle
+*.pkl
+
+# PDFs generated from reports
+*.pdf
+
+# Misc
+.cache/
