@@ -29,26 +29,17 @@ def compute_flux(C, D, dx, dy):
 			Positive flux corresponds to transport in the positive coordinate direction, while 
 			negative flux indicates transport in the opposite direction.
 	"""
-	rows, cols = C.shape
+	# Face-centered diffusivity values between neighboring cells.
+	D_x = 0.5 * (D[:, :-1] + D[:, 1:])
+	D_y = 0.5 * (D[:-1, :] + D[1:, :])
 
-	Jx = np.zeros((rows, cols - 1))
-	Jy = np.zeros((rows - 1, cols))
+	# Concentration gradients across cell faces.
+	dCdx = (C[:, 1:] - C[:, :-1]) / dx
+	dCdy = (C[1:, :] - C[:-1, :]) / dy
 
-	# Horizontal fluxes: between cell (i, j) and cell (i, j + 1)
-	for i in range(rows):
-		for j in range(cols - 1):
-			C_diff = C[i, j + 1] - C[i, j]
-			D_avg = 0.5 * (D[i, j] + D[i, j + 1])
-
-			Jx[i, j] = -D_avg * C_diff / dx
-
-	# Vertical fluxes: between cell (i, j) and cell (i + 1, j)
-	for i in range(rows - 1):
-		for j in range(cols):
-			C_diff = C[i + 1, j] - C[i, j]
-			D_avg = 0.5 * (D[i, j] + D[i + 1, j])
-
-			Jy[i, j] = -D_avg * C_diff / dy
+	# Fick's law: J = -D grad(C)
+	Jx = -D_x * dCdx
+	Jy = -D_y * dCdy
 
 	return Jx, Jy
 
@@ -88,22 +79,16 @@ def compute_flux_divergence(Jx, Jy, dx, dy, shape):
 			Positive outgoing flux decreases concentration in the source grid cell, while the
 			same flux increases concentration in the neighboring receiving grid cell.
 	"""
-	dCdt = np.zeros(shape)
+	dCdt = np.zeros(shape, dtype=Jx.dtype)
 
-	# Horizontal flux contribution
-	for i in range(shape[0]):
-		for j in range(shape[1] - 1):
-			flux = Jx[i, j]
+	# Horizontal flux contribution.
+	# Jx[:, j] is the flux from cell j to cell j + 1.
+	dCdt[:, :-1] -= Jx / dx
+	dCdt[:, 1:] += Jx / dx
 
-			dCdt[i, j] -= flux / dx
-			dCdt[i, j + 1] += flux / dx
-
-	# Vertical flux contribution
-	for i in range(shape[0] - 1):
-		for j in range(shape[1]):
-			flux = Jy[i, j]
-
-			dCdt[i, j] -= flux / dy
-			dCdt[i + 1, j] += flux / dy
+	# Vertical flux contribution.
+	# Jy[i, :] is the flux from row i to row i + 1.
+	dCdt[:-1, :] -= Jy / dy
+	dCdt[1:, :] += Jy / dy
 
 	return dCdt

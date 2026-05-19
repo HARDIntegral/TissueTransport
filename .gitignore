@@ -17,6 +17,13 @@ build/
 dist/
 *.egg-info/
 
+# Rust / Cargo
+**/target/
+Cargo.lock
+*.rlib
+*.profraw
+*.profdata
+
 # Testing
 .pytest_cache/
 .coverage
@@ -43,7 +50,6 @@ htmlcov/
 *.npy
 *.npz
 
-
 # Simulation outputs
 outputs/
 results/
@@ -64,6 +70,13 @@ data/raw/
 
 # PDFs generated from reports
 *.pdf
+
+# Rust + maturin / PyO3 build artifacts
+*.so
+*.dylib
+*.dll
+.wheelhouse/
+.maturin/
 
 # Misc
 .cache/
