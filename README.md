@@ -39,11 +39,7 @@ Future goals:
 
 Oxygen consumption is modeled using Michaelis-Menten kinetics:
 
-$$
-R(C)
-=
-\frac{V_{max}C}{K_m + C}
-$$
+$$R(C)=\frac{V_{max}C}{K_m+C}$$
 
 where:
 
@@ -53,13 +49,7 @@ where:
 
 The governing equation becomes:
 
-$$
-\frac{\partial C}{\partial t}
-=
-D\nabla^2C
--
-\frac{V_{max}C}{K_m+C}
-$$
+$$\frac{\partial C}{\partial t}=D\nabla^2 C-\frac{V_{max}C}{K_m+C}$$
 
 which creates biologically realistic steady-state oxygen gradients around vascular networks.
 
@@ -69,7 +59,20 @@ which creates biologically realistic steady-state oxygen gradients around vascul
 
 The animation below shows oxygen diffusing outward from segmented blood vessels into surrounding tissue while metabolism continuously removes oxygen.
 
-![Oxygen diffusion animation](oxygen_diffusion.gif)
+<table>
+<tr>
+<td align="center"><b>Original vessel structure</b></td>
+<td align="center"><b>Oxygen diffusion over time</b></td>
+</tr>
+<tr>
+<td>
+<img src="blood_vessel_network_images/structure3.png" width="300">
+</td>
+<td>
+<img src="oxygen_diffusion.gif" width="500">
+</td>
+</tr>
+</table>
 
 Observed behavior:
 
@@ -104,37 +107,26 @@ This is effectively a sensitivity analysis of the transport model and helps cali
 
 Diffusion is modeled using Fick's Law:
 
-$$
-\mathbf{J} = -D_{\text{eff}} \nabla C
-$$
+$$\mathbf{J}=-D_{\mathrm{eff}}\nabla C$$
 
 where:
 
-- $ \mathbf{J} $: flux vector
-- $ D_{\text{eff}} $: effective diffusivity
-- $ C $: concentration
+- $\mathbf{J}$: flux vector
+- $D_{\mathrm{eff}}$: effective diffusivity
+- $C$: concentration
 
 Concentration evolution:
 
-$$
-\frac{\partial C}{\partial t}
-=
--\nabla \cdot \mathbf{J}
-$$
+$$\frac{\partial C}{\partial t}=-\nabla\cdot\mathbf{J}$$
 
 Effective diffusivity depends on local tissue properties:
 
-$$
-D_{\text{eff}}
-=
-D
-\frac{\epsilon}{\tau}
-$$
+$$D_{\mathrm{eff}}=D\frac{\epsilon}{\tau}$$
 
 where:
 
-- $ D $: intrinsic diffusivity
-- $ \epsilon $: porosity
-- $ \tau $: tortuosity
+- $D$: intrinsic diffusivity
+- $\epsilon$: porosity
+- $\tau$: tortuosity
 
 ---
