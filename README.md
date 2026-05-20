@@ -230,6 +230,20 @@ which creates biologically realistic steady-state oxygen gradients around vascul
 
 ---
 
+## Modeling Assumptions
+
+Current simulations assume:
+
+- Tissue behaves as a homogeneous porous medium
+- Diffusion occurs in two spatial dimensions
+- Temperature remains constant during simulation
+- Vessel oxygen concentration is fixed
+- Blood flow and advection are neglected
+- Diffusion is isotropic within local tissue regions
+- Tissue metabolism follows Michaelis-Menten kinetics
+
+---
+
 ## Oxygen Diffusion Dynamics
 
 The animation below shows oxygen diffusing outward from segmented blood vessels into surrounding tissue while metabolism continuously removes oxygen.
