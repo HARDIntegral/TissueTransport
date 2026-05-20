@@ -39,6 +39,149 @@ Future goals:
 
 ---
 
+## Dependencies and Setup
+
+This project uses both Python and Rust. Python handles image processing, simulation setup, visualization, and benchmarking. Rust/WGPU handles the accelerated reaction-diffusion solver and exposes it back to Python through a NumPy-compatible extension module.
+
+Required tools:
+
+- Python 3.13 or compatible Python 3.x version
+- Rust and Cargo
+- A GPU supported by WGPU/Metal/Vulkan/DirectX/OpenGL backend support
+- A Python virtual environment
+- `maturin` for building the Rust extension into the Python environment
+
+Python dependencies include:
+
+- `numpy`
+- `matplotlib`
+- `tqdm`
+- `pillow`
+
+Install Python dependencies inside a virtual environment:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install numpy matplotlib tqdm pillow maturin
+```
+
+On macOS or Linux, the virtual environment should appear in the terminal prompt before running the project:
+
+```bash
+(.venv)
+```
+
+---
+
+## Building the Rust/WGPU Python Extension
+
+The Rust GPU solver lives inside:
+
+```bash
+simulation/gpu_solver
+```
+
+Build and install the Rust extension into the active Python virtual environment:
+
+```bash
+cd simulation/gpu_solver
+maturin develop --release --features python
+```
+
+Then return to the project root:
+
+```bash
+cd ../..
+```
+
+Verify that Python can import the compiled solver:
+
+```bash
+python -c "import gpu_solver; print(gpu_solver)"
+```
+
+If the import succeeds, the Python side can call the Rust/WGPU solver through:
+
+```python
+gpu_solver.run_steps_auto_numpy(...)
+```
+
+---
+
+## Running the Simulation
+
+From the project root, run the main simulation script:
+
+```bash
+python simulation/main.py
+```
+
+This will:
+
+- load and preprocess the vessel image
+- create the tissue domain
+- run oxygen diffusion and consumption through the Rust/WGPU solver
+- save the diffusion animation as `oxygen_diffusion.gif`
+- run the Michaelis-Menten parameter sweep
+- save the parameter sweep as `parameter_sweep.png`
+
+The main simulation uses chunked GPU execution. Instead of returning to Python every timestep, many intermediate timesteps stay inside Rust/GPU memory before a sampled frame is returned for plotting or GIF generation.
+
+---
+
+## Running Tests
+
+Rust solver tests are located in:
+
+```bash
+simulation/gpu_solver/tests
+```
+
+Run all Rust tests from the GPU solver directory:
+
+```bash
+cd simulation/gpu_solver
+cargo test
+```
+
+To check the Python feature build without producing a full optimized extension:
+
+```bash
+cargo check --features python
+```
+
+To check the optimized Python-enabled build:
+
+```bash
+cargo check --release --features python
+```
+
+The tests validate the CPU fallback, WGPU solver behavior, vessel reset logic, Michaelis-Menten consumption, and equivalence against reference outputs.
+
+---
+
+## Running Benchmarks
+
+After building the Python extension with `maturin`, run the benchmark script from the project root:
+
+```bash
+python simulation/benchmark.py
+```
+
+The benchmark compares:
+
+- NumPy-optimized Python reference solver
+- Rust/WGPU solver called through the Python NumPy interface
+
+The script performs one warmup run for each solver and excludes it from the reported statistics. This helps remove one-time initialization overhead from GPU pipeline setup, shader compilation, memory allocation, and caching. It then records five measured runs, calculates mean execution time, standard deviation, per-run speedups, and saves the performance plot as:
+
+```bash
+benchmark_performance.png
+```
+
+---
+
 ## Mathematical Model
 
 Diffusion is modeled using Fick's Law:
@@ -184,4 +327,3 @@ Validation process:
 	- Variability, standard deviation, and average speedups were recorded across repeated runs
 
 This workflow helps ensure that performance gains do not come at the expense of physical correctness. The original reference solver remains part of the project as validation infrastructure rather than being discarded after optimization.
-
