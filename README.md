@@ -18,6 +18,7 @@ Current implementation includes:
 - Flux and flux divergence calculations
 - Species-specific transport properties
 - Michaelis-Menten oxygen consumption
+- GPU acceleration
 - GIF generation for diffusion dynamics
 - Parameter sensitivity analysis
 
@@ -28,10 +29,41 @@ Future goals:
 - 3D tissue domains
 - Multi-species transport
 - Reaction-diffusion systems
-- GPU acceleration
 - Visualization/interactive simulations
 - Vessel radius-dependent oxygen delivery
 - Coupled angiogenesis and hypoxia models
+- Adaptive mesh refinement
+- Hemodynamic flow coupling
+- 3D GPU acceleration
+- Experimental parameter fitting against biological data
+
+---
+
+## Mathematical Model
+
+Diffusion is modeled using Fick's Law:
+
+$$\mathbf{J}=-D_{\mathrm{eff}}\nabla C$$
+
+where:
+
+- $\mathbf{J}$: flux vector
+- $D_{\mathrm{eff}}$: effective diffusivity
+- $C$: concentration
+
+Concentration evolution:
+
+$$\frac{\partial C}{\partial t}=-\nabla\cdot\mathbf{J}$$
+
+Effective diffusivity depends on local tissue properties:
+
+$$D_{\mathrm{eff}}=D\frac{\epsilon}{\tau}$$
+
+where:
+
+- $D$: intrinsic diffusivity
+- $\epsilon$: porosity
+- $\tau$: tortuosity
 
 ---
 
@@ -103,30 +135,53 @@ The purpose of these sweeps is to determine parameter regimes that produce biolo
 
 This is effectively a sensitivity analysis of the transport model and helps calibrate consumption parameters against expected tissue behavior.
 
-## Mathematical Model
+---
 
-Diffusion is modeled using Fick's Law:
+## CPU vs GPU Performance Benchmark
 
-$$\mathbf{J}=-D_{\mathrm{eff}}\nabla C$$
+The Rust/WGPU implementation was benchmarked against the original NumPy-optimized Python reference solver using identical reaction-diffusion simulations on a $1000\times1000$ grid. Performance measurements were repeated across multiple runs and summarized with average execution time, standard deviation, and per-run variability.
 
-where:
+![Benchmark comparison](benchmark_performance.png)
 
-- $\mathbf{J}$: flux vector
-- $D_{\mathrm{eff}}$: effective diffusivity
-- $C$: concentration
+Observed behavior:
 
-Concentration evolution:
+- The Rust/WGPU solver consistently outperformed the NumPy-based implementation
+- Variability between runs remained small after initialization overhead was removed
+- GPU acceleration becomes increasingly beneficial as spatial resolution increases
+- Larger grids benefit from keeping timesteps and buffers resident on the GPU rather than repeatedly transferring arrays
 
-$$\frac{\partial C}{\partial t}=-\nabla\cdot\mathbf{J}$$
-
-Effective diffusivity depends on local tissue properties:
-
-$$D_{\mathrm{eff}}=D\frac{\epsilon}{\tau}$$
-
-where:
-
-- $D$: intrinsic diffusivity
-- $\epsilon$: porosity
-- $\tau$: tortuosity
+**Benchmark note:** One preliminary warmup run was intentionally excluded from the reported statistics for each solver. This allows initialization costs such as GPU pipeline creation, shader compilation, memory allocation, and caching overhead to stabilize before measuring steady-state performance.
 
 ---
+
+## GPU Optimization and Validation Workflow
+
+Performance improvements alone are not sufficient for scientific simulation. The GPU implementation was validated against the original NumPy-optimized Python reference solver throughout development to ensure numerical consistency while optimizing execution speed.
+
+Validation process:
+
+1. **Reference implementation**
+	- The original explicit finite-difference solver was preserved as a CPU baseline (`solver_reference/`)
+	- All new GPU logic was compared against this implementation rather than replacing it directly
+
+2. **Numerical equivalence testing**
+	- Identical concentration fields, diffusivity maps, vessel masks, and Michaelis-Menten parameters were supplied to both solvers
+	- Output concentrations were compared after multiple timesteps
+	- Center-cell concentrations and absolute error metrics were monitored during optimization
+
+3. **Incremental optimization**
+	- Initial GPU implementations suffered from repeated buffer allocation and CPU↔GPU transfer overhead
+	- Persistent buffers and batched timestep execution were introduced to minimize readbacks
+	- Double buffering allowed concentration fields to alternate between GPU buffers without intermediate copies
+
+4. **Fallback verification**
+	- A CPU fallback path remains available when compatible GPU hardware is unavailable
+	- GPU and CPU paths share equivalent validated physics models
+
+5. **Benchmarking under realistic workloads**
+	- Benchmarks were performed on large grids ($1000\times1000$) to evaluate scaling behavior
+	- Warmup runs were excluded to remove one-time initialization costs
+	- Variability, standard deviation, and average speedups were recorded across repeated runs
+
+This workflow helps ensure that performance gains do not come at the expense of physical correctness. The original reference solver remains part of the project as validation infrastructure rather than being discarded after optimization.
+
