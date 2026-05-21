@@ -103,7 +103,7 @@ ax_co2.imshow(mask, cmap="Blues", alpha=0.4)
 plt.colorbar(concentration_plot, ax=ax_o2, label="O2 concentration")
 plt.colorbar(co2_plot, ax=ax_co2, label="CO2 concentration")
 
-ax_o2.set_title("Oxygen | step 0")
+ax_o2.set_title("Oxygen | step 0 | dt = {simulation_dt}")
 ax_co2.set_title("Carbon dioxide | step 0 | dt = {simulation_dt}")
 
 # Store sampled frames so the simulation can be saved as a GIF later.
@@ -139,7 +139,7 @@ for step in tqdm(
 	concentration_plot.set_data(test_domain.concentration)
 	co2_plot.set_data(rust_arrays["carbon_dioxide"])
 
-	ax_o2.set_title(f"Oxygen | step {step}")
+	ax_o2.set_title(f"Oxygen | step {step} | dt = {simulation_dt}")
 	ax_co2.set_title(f"Carbon dioxide | step {step} | dt = {simulation_dt}")
 	plt.pause(0.001)
 
