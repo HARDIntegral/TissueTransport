@@ -1,6 +1,5 @@
-use gpu_solver::gpu::WgpuSolver;
-use gpu_solver::timestep::{FusedStepInput, SolverWorkspace};
-use gpu_solver::{Grid2D, StepInput};
+use gpu_solver::gpu::WgpuGasExchangeSolver;
+use gpu_solver::{explicit_gas_exchange_step, GasExchangeStepInput, Grid2D};
 use std::time::Instant;
 
 fn main() {
@@ -11,82 +10,67 @@ fn main() {
     let grid = Grid2D::new(width, height, 1.0, 1.0);
     let n = grid.len();
 
-    let mut concentration = vec![1.0_f32; n];
-
-    let input_template = StepInput {
-        grid,
-        concentration: concentration.clone(),
-        diffusivity: vec![1.0; n],
-        vmax: vec![0.01; n],
-        km: vec![1.0; n],
-        vessel_mask: vec![false; n],
-        vessel_concentration: vec![0.0; n],
-        dt: 0.1,
-        reset_vessels: true,
-    };
-
-    let mut workspace = SolverWorkspace::new(&input_template);
-    let mut concentration_next = vec![0.0_f32; n];
+    let mut oxygen = vec![1.0_f32; n];
+    let mut carbon_dioxide = vec![0.0_f32; n];
+    let diffusivity_o2 = vec![1.0; n];
+    let diffusivity_co2 = vec![0.8; n];
+    let vmax = vec![0.01; n];
+    let km = vec![1.0; n];
+    let vessel_mask = vec![false; n];
+    let vessel_o2 = vec![0.0; n];
+    let vessel_co2 = vec![0.0; n];
+    let dt = 0.1;
+    let co2_yield = 1.0;
 
     let start = Instant::now();
-
     for _ in 0..steps {
-        workspace.explicit_step_fused(FusedStepInput {
+        let mut oxygen_next = vec![0.0; n];
+        let mut carbon_dioxide_next = vec![0.0; n];
+        (oxygen, carbon_dioxide) = explicit_gas_exchange_step(GasExchangeStepInput {
             grid,
-            concentration_current: &concentration,
-            concentration_next: &mut concentration_next,
-            diffusivity: &input_template.diffusivity,
-            vmax: &input_template.vmax,
-            km: &input_template.km,
-            vessel_mask: &input_template.vessel_mask,
-            vessel_concentration: &input_template.vessel_concentration,
-            dt: input_template.dt,
-            reset_vessels: input_template.reset_vessels,
+            oxygen_current: &oxygen,
+            carbon_dioxide_current: &carbon_dioxide,
+            oxygen_next: &mut oxygen_next,
+            carbon_dioxide_next: &mut carbon_dioxide_next,
+            oxygen_diffusivity: &diffusivity_o2,
+            carbon_dioxide_diffusivity: &diffusivity_co2,
+            vmax: &vmax,
+            km: &km,
+            vessel_mask: &vessel_mask,
+            vessel_oxygen_concentration: &vessel_o2,
+            vessel_carbon_dioxide_concentration: &vessel_co2,
+            dt,
+            co2_yield,
+            reset_vessels: true,
         });
-
-        std::mem::swap(&mut concentration, &mut concentration_next);
     }
-
     let cpu_elapsed = start.elapsed();
 
-    let solver = pollster::block_on(WgpuSolver::new(grid));
-    let mut gpu_concentration = vec![1.0_f32; n];
-
+    let solver = pollster::block_on(WgpuGasExchangeSolver::new(grid));
     let gpu_start = Instant::now();
-
-    gpu_concentration = pollster::block_on(solver.run_steps(
-        &gpu_concentration,
-        &input_template.diffusivity,
-        &input_template.vmax,
-        &input_template.km,
-        &input_template.vessel_mask,
-        &input_template.vessel_concentration,
-        input_template.dt,
-        input_template.reset_vessels,
-        steps as usize,
+    let (gpu_o2, gpu_co2) = pollster::block_on(solver.run_gas_exchange_steps(
+        &vec![1.0; n],
+        &vec![0.0; n],
+        &diffusivity_o2,
+        &diffusivity_co2,
+        &vmax,
+        &km,
+        &vessel_mask,
+        &vessel_o2,
+        &vessel_co2,
+        dt,
+        co2_yield,
+        steps,
     ));
-
     let gpu_elapsed = gpu_start.elapsed();
 
-    println!("Grid: {}x{}", width, height);
-    println!("Steps: {}", steps);
-
-    println!("\nCPU fused:");
-    println!("Elapsed: {:.3?}", cpu_elapsed);
-    println!("Time per step: {:.6?}", cpu_elapsed / steps);
-
-    println!("\nGPU persistent buffers + one readback:");
-    println!("Elapsed: {:.3?}", gpu_elapsed);
-    println!("Time per step: {:.6?}", gpu_elapsed / steps);
-
-    let center_idx = n / 2;
-    let center_difference = (concentration[center_idx] - gpu_concentration[center_idx]).abs();
-
-    println!("\nCorrectness check:");
-    println!("CPU center concentration: {:.6}", concentration[center_idx]);
+    println!("CPU: {:?}\nGPU: {:?}", cpu_elapsed, gpu_elapsed);
     println!(
-        "GPU center concentration: {:.6}",
-        gpu_concentration[center_idx]
+        "Center O2 diff: {:.6e}",
+        (oxygen[n / 2] - gpu_o2[n / 2]).abs()
     );
-    println!("Absolute difference: {:.6e}", center_difference);
+    println!(
+        "Center CO2 diff: {:.6e}",
+        (carbon_dioxide[n / 2] - gpu_co2[n / 2]).abs()
+    );
 }

@@ -1,3 +1,3 @@
 pub mod solver;
 
-pub use solver::WgpuSolver;
+pub use solver::WgpuGasExchangeSolver;

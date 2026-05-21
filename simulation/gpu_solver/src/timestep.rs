@@ -1,253 +1,322 @@
-use crate::types::{Grid2D, StepInput};
+use crate::types::Grid2D;
 
-/// Borrowed arrays and scalar parameters needed for one fused timestep.
+/// Borrowed arrays and scalar parameters needed for one coupled O₂/CO₂ timestep.
 ///
-/// This struct groups the concentration field, transport properties, reaction
-/// parameters, vessel source mask, and output buffer without taking ownership of
-/// the data. The CPU reference path uses this to avoid allocating temporary arrays
-/// inside every timestep, and the layout mirrors the same data that is passed into
-/// the WGPU compute shader.
+/// This struct mirrors the coupled Python reference case used to validate gas
+/// exchange behavior. Oxygen diffuses, is consumed through Michaelis-Menten
+/// metabolism, and is reset high in vessel cells. Carbon dioxide diffuses, is
+/// produced from the oxygen consumption rate, and is reset low in vessel cells.
 ///
 /// Parameters:
-/// grid                  -> Two-dimensional grid metadata, including shape and spacing.
-/// concentration_current -> Concentration field at the start of the timestep.
-/// concentration_next    -> Output buffer that receives the updated concentration field.
-/// diffusivity           -> Effective diffusivity at each grid cell.
-/// vmax                  -> Michaelis-Menten maximum consumption rate at each cell.
-/// km                    -> Michaelis-Menten half-saturation constant at each cell.
-/// vessel_mask           -> Boolean mask marking cells that act as vessel/source cells.
-/// vessel_concentration  -> Fixed concentration imposed on vessel cells when enabled.
-/// dt                    -> Timestep size.
-/// reset_vessels         -> Whether vessel cells are reset after the diffusion/reaction update.
-///
-/// Notes:
-/// The timestep is explicit, meaning every cell is updated from the old
-/// concentration field and written into a separate output buffer. This avoids
-/// mixing old and new values during the same update.
-pub struct FusedStepInput<'a> {
+/// grid                                 -> Two-dimensional grid metadata.
+/// oxygen_current                       -> Oxygen concentration at the start of the timestep.
+/// carbon_dioxide_current               -> Carbon dioxide concentration at the start of the timestep.
+/// oxygen_next                          -> Output buffer for updated oxygen concentration.
+/// carbon_dioxide_next                  -> Output buffer for updated carbon dioxide concentration.
+/// oxygen_diffusivity                   -> Effective oxygen diffusivity at each grid cell.
+/// carbon_dioxide_diffusivity           -> Effective carbon dioxide diffusivity at each grid cell.
+/// vmax                                 -> Michaelis-Menten maximum oxygen consumption rate.
+/// km                                   -> Michaelis-Menten half-saturation constant.
+/// vessel_mask                          -> Boolean mask marking vessel/source/sink cells.
+/// vessel_oxygen_concentration          -> Fixed oxygen concentration imposed on vessel cells.
+/// vessel_carbon_dioxide_concentration  -> Fixed carbon dioxide concentration imposed on vessel cells.
+/// dt                                   -> Timestep size.
+/// co2_yield                            -> CO₂ produced per unit O₂ consumed.
+/// reset_vessels                        -> Whether vessel cells are reset after the update.
+pub struct GasExchangeStepInput<'a> {
     pub grid: Grid2D,
-    pub concentration_current: &'a [f32],
-    pub concentration_next: &'a mut [f32],
-    pub diffusivity: &'a [f32],
+    pub oxygen_current: &'a [f32],
+    pub carbon_dioxide_current: &'a [f32],
+    pub oxygen_next: &'a mut [f32],
+    pub carbon_dioxide_next: &'a mut [f32],
+    pub oxygen_diffusivity: &'a [f32],
+    pub carbon_dioxide_diffusivity: &'a [f32],
     pub vmax: &'a [f32],
     pub km: &'a [f32],
     pub vessel_mask: &'a [bool],
-    pub vessel_concentration: &'a [f32],
+    pub vessel_oxygen_concentration: &'a [f32],
+    pub vessel_carbon_dioxide_concentration: &'a [f32],
     pub dt: f32,
+    pub co2_yield: f32,
     pub reset_vessels: bool,
 }
 
-impl FusedStepInput<'_> {
+impl GasExchangeStepInput<'_> {
     fn validate(&self) {
         let n = self.grid.len();
 
-        assert_eq!(self.concentration_current.len(), n);
-        assert_eq!(self.concentration_next.len(), n);
-        assert_eq!(self.diffusivity.len(), n);
+        assert_eq!(self.oxygen_current.len(), n);
+        assert_eq!(self.carbon_dioxide_current.len(), n);
+        assert_eq!(self.oxygen_next.len(), n);
+        assert_eq!(self.carbon_dioxide_next.len(), n);
+        assert_eq!(self.oxygen_diffusivity.len(), n);
+        assert_eq!(self.carbon_dioxide_diffusivity.len(), n);
         assert_eq!(self.vmax.len(), n);
         assert_eq!(self.km.len(), n);
         assert_eq!(self.vessel_mask.len(), n);
-        assert_eq!(self.vessel_concentration.len(), n);
+        assert_eq!(self.vessel_oxygen_concentration.len(), n);
+        assert_eq!(self.vessel_carbon_dioxide_concentration.len(), n);
     }
 }
-
-/// Advance the concentration field by one explicit reaction-diffusion timestep.
+/// Advance coupled oxygen and carbon dioxide fields by one CPU reference timestep.
 ///
-/// This is the simple one-step CPU reference API. It delegates to `run_steps_cpu`
-/// with `steps = 1`, so the one-step and multi-step CPU paths use the same fused
-/// stencil implementation.
-///
-/// Parameters:
-/// input -> Complete timestep input containing grid, concentration, diffusivity,
-///          reaction terms, vessel source terms, and timestep size.
-///
-/// Returns:
-/// A new concentration vector after one timestep.
-pub fn explicit_step(input: &StepInput) -> Vec<f32> {
-    run_steps_cpu(input, 1)
-}
-
-/// Run multiple CPU reaction-diffusion timesteps using the fused reference path.
-///
-/// This is the CPU fallback path when WGPU is unavailable, and it is also the
-/// reference implementation used for checking GPU correctness. The function keeps
-/// two concentration buffers and swaps them after each timestep, so it avoids
-/// allocating a new concentration array every iteration.
+/// This helper allocates fresh output buffers, delegates to the fused O₂/CO₂
+/// stencil, and returns the updated fields. It is used by tests and validation
+/// code as the readable one-step reference for the coupled gas-exchange model.
 ///
 /// Parameters:
-/// input -> Complete reaction-diffusion input state.
-/// steps -> Number of explicit timesteps to run.
+/// input -> Complete borrowed gas-exchange timestep input.
 ///
 /// Returns:
-/// Concentration field after `steps` timesteps.
-///
-/// Notes:
-/// The physical time simulated by this function is `steps * input.dt`. If the grid
-/// spacing is reduced, the timestep may also need to be reduced because explicit
-/// diffusion methods are limited by a stability condition proportional to `dx^2 / D`.
-pub fn run_steps_cpu(input: &StepInput, steps: usize) -> Vec<f32> {
+/// `(oxygen_next, carbon_dioxide_next)` after one timestep.
+pub fn explicit_gas_exchange_step(input: GasExchangeStepInput<'_>) -> (Vec<f32>, Vec<f32>) {
     input.validate();
 
-    if steps == 0 {
-        return input.concentration.clone();
-    }
+    let n = input.grid.len();
+    let mut oxygen_next = vec![0.0; n];
+    let mut carbon_dioxide_next = vec![0.0; n];
+    explicit_gas_exchange_step_fused(GasExchangeStepInput {
+        grid: input.grid,
+        oxygen_current: input.oxygen_current,
+        carbon_dioxide_current: input.carbon_dioxide_current,
+        oxygen_next: &mut oxygen_next,
+        carbon_dioxide_next: &mut carbon_dioxide_next,
+        oxygen_diffusivity: input.oxygen_diffusivity,
+        carbon_dioxide_diffusivity: input.carbon_dioxide_diffusivity,
+        vmax: input.vmax,
+        km: input.km,
+        vessel_mask: input.vessel_mask,
+        vessel_oxygen_concentration: input.vessel_oxygen_concentration,
+        vessel_carbon_dioxide_concentration: input.vessel_carbon_dioxide_concentration,
+        dt: input.dt,
+        co2_yield: input.co2_yield,
+        reset_vessels: input.reset_vessels,
+    });
 
-    let mut concentration_current = input.concentration.clone();
-    let mut concentration_next = vec![0.0; input.grid.len()];
-    let mut workspace = SolverWorkspace::new(input);
-
-    for _ in 0..steps {
-        workspace.explicit_step_fused(FusedStepInput {
-            grid: input.grid,
-            concentration_current: &concentration_current,
-            concentration_next: &mut concentration_next,
-            diffusivity: &input.diffusivity,
-            vmax: &input.vmax,
-            km: &input.km,
-            vessel_mask: &input.vessel_mask,
-            vessel_concentration: &input.vessel_concentration,
-            dt: input.dt,
-            reset_vessels: input.reset_vessels,
-        });
-
-        std::mem::swap(&mut concentration_current, &mut concentration_next);
-    }
-
-    concentration_current
+    (oxygen_next, carbon_dioxide_next)
 }
 
-/// Workspace object for CPU fused timestep updates.
+/// Advance one timestep using a fused coupled O₂/CO₂ gas-exchange stencil.
 ///
-/// The current CPU implementation does not need to store intermediate arrays inside
-/// the workspace, because the caller provides both the current and next concentration
-/// buffers. The type still exists as the CPU solver entry point so the structure of
-/// the CPU path stays parallel to the GPU path, where a solver object owns reusable
-/// buffers, pipeline state, and dispatch logic.
+/// The oxygen field controls the Michaelis-Menten metabolic consumption term.
+/// That same oxygen consumption term is subtracted from oxygen and added to
+/// carbon dioxide using `co2_yield`.
 ///
-/// Notes:
-/// Keeping this as a workspace instead of a free function makes it easier to add
-/// future CPU-side reusable scratch buffers without changing the public call pattern.
-pub struct SolverWorkspace;
+/// The implementation keeps the hot interior loop separate from boundary handling
+/// so most cells avoid per-neighbor bounds checks.
+pub fn explicit_gas_exchange_step_fused(mut input: GasExchangeStepInput<'_>) {
+    input.validate();
 
-impl SolverWorkspace {
-    /// Create a CPU solver workspace for a fixed problem shape.
-    ///
-    /// The input is validated here so shape mismatches are caught before timestep
-    /// execution begins.
-    pub fn new(input: &StepInput) -> Self {
-        input.validate();
-        Self
+    let grid = input.grid;
+    let width = grid.width;
+    let height = grid.height;
+    let inv_dx2 = 1.0 / (grid.dx * grid.dx);
+    let inv_dy2 = 1.0 / (grid.dy * grid.dy);
+    let dt = input.dt;
+    let co2_yield = input.co2_yield;
+
+    let oxygen_current = input.oxygen_current;
+    let carbon_dioxide_current = input.carbon_dioxide_current;
+    let oxygen_diffusivity = input.oxygen_diffusivity;
+    let carbon_dioxide_diffusivity = input.carbon_dioxide_diffusivity;
+    let vmax = input.vmax;
+    let km = input.km;
+
+    if width == 0 || height == 0 {
+        return;
     }
 
-    /// Advance one timestep using a fused finite-difference reaction-diffusion stencil.
-    ///
-    /// The update combines spatial diffusion, Michaelis-Menten consumption, and optional
-    /// vessel concentration reset in one pass. Interior cells are handled separately from
-    /// boundary cells so the hot inner loop does not need boundary checks.
-    ///
-    /// Parameters:
-    /// input -> Borrowed timestep buffers and scalar parameters. The current concentration
-    ///          is read from `concentration_current`, and the result is written into
-    ///          `concentration_next`.
-    ///
-    /// Notes:
-    /// Diffusion is computed with a finite-difference stencil using face-averaged
-    /// diffusivity:
-    ///
-    /// D_left  = 0.5 * (D_center + D_left_cell)
-    /// D_right = 0.5 * (D_center + D_right_cell)
-    /// D_up    = 0.5 * (D_center + D_up_cell)
-    /// D_down  = 0.5 * (D_center + D_down_cell)
-    ///
-    /// The reaction term follows Michaelis-Menten consumption:
-    ///
-    /// consumption = vmax * C / (km + C)
-    ///
-    /// The final explicit update is:
-    ///
-    /// C_next = C_current + dt * (diffusion - consumption)
-    ///
-    /// If `reset_vessels` is enabled, cells marked in `vessel_mask` are overwritten
-    /// after the update with their prescribed `vessel_concentration` values. This treats
-    /// vessel cells as fixed concentration source cells.
-    pub fn explicit_step_fused(&mut self, mut input: FusedStepInput<'_>) {
-        input.validate();
+    if width > 2 && height > 2 {
+        for row in 1..(height - 1) {
+            let row_offset = row * width;
+            let up_offset = (row - 1) * width;
+            let down_offset = (row + 1) * width;
 
-        let grid = input.grid;
-        let width = grid.width;
-        let height = grid.height;
-        let inv_dx2 = 1.0 / (grid.dx * grid.dx);
-        let inv_dy2 = 1.0 / (grid.dy * grid.dy);
-        let dt = input.dt;
-        let concentration_current = input.concentration_current;
-        let diffusivity = input.diffusivity;
-        let vmax = input.vmax;
-        let km = input.km;
+            for col in 1..(width - 1) {
+                let idx = row_offset + col;
+                let left_idx = idx - 1;
+                let right_idx = idx + 1;
+                let up_idx = up_offset + col;
+                let down_idx = down_offset + col;
 
-        if width == 0 || height == 0 {
-            return;
-        }
+                let oxygen_center = oxygen_current[idx];
+                let carbon_dioxide_center = carbon_dioxide_current[idx];
 
-        if width > 2 && height > 2 {
-            for row in 1..(height - 1) {
-                let row_offset = row * width;
-                let up_offset = (row - 1) * width;
-                let down_offset = (row + 1) * width;
+                let oxygen_diffusion = diffusion_stencil(
+                    oxygen_center,
+                    oxygen_current[left_idx],
+                    oxygen_current[right_idx],
+                    oxygen_current[up_idx],
+                    oxygen_current[down_idx],
+                    oxygen_diffusivity[idx],
+                    oxygen_diffusivity[left_idx],
+                    oxygen_diffusivity[right_idx],
+                    oxygen_diffusivity[up_idx],
+                    oxygen_diffusivity[down_idx],
+                    inv_dx2,
+                    inv_dy2,
+                );
 
-                for col in 1..(width - 1) {
-                    let idx = row_offset + col;
-                    let left_idx = idx - 1;
-                    let right_idx = idx + 1;
-                    let up_idx = up_offset + col;
-                    let down_idx = down_offset + col;
+                let carbon_dioxide_diffusion = diffusion_stencil(
+                    carbon_dioxide_center,
+                    carbon_dioxide_current[left_idx],
+                    carbon_dioxide_current[right_idx],
+                    carbon_dioxide_current[up_idx],
+                    carbon_dioxide_current[down_idx],
+                    carbon_dioxide_diffusivity[idx],
+                    carbon_dioxide_diffusivity[left_idx],
+                    carbon_dioxide_diffusivity[right_idx],
+                    carbon_dioxide_diffusivity[up_idx],
+                    carbon_dioxide_diffusivity[down_idx],
+                    inv_dx2,
+                    inv_dy2,
+                );
 
-                    let center = concentration_current[idx];
-                    let d_center = diffusivity[idx];
+                let oxygen_consumption = michaelis_menten(oxygen_center, vmax[idx], km[idx]);
 
-                    let d_left = 0.5 * (d_center + diffusivity[left_idx]);
-                    let d_right = 0.5 * (d_center + diffusivity[right_idx]);
-                    let d_up = 0.5 * (d_center + diffusivity[up_idx]);
-                    let d_down = 0.5 * (d_center + diffusivity[down_idx]);
-
-                    let diffusion = d_left * (concentration_current[left_idx] - center) * inv_dx2
-                        + d_right * (concentration_current[right_idx] - center) * inv_dx2
-                        + d_up * (concentration_current[up_idx] - center) * inv_dy2
-                        + d_down * (concentration_current[down_idx] - center) * inv_dy2;
-
-                    let consumption = michaelis_menten(center, vmax[idx], km[idx]);
-                    input.concentration_next[idx] = center + dt * (diffusion - consumption);
-                }
-            }
-        }
-
-        // Top and bottom rows.
-        for col in 0..width {
-            update_boundary_cell(&mut input, 0, col, inv_dx2, inv_dy2);
-
-            if height > 1 {
-                update_boundary_cell(&mut input, height - 1, col, inv_dx2, inv_dy2);
-            }
-        }
-
-        // Left and right columns, excluding corners already handled above.
-        if height > 2 {
-            for row in 1..(height - 1) {
-                update_boundary_cell(&mut input, row, 0, inv_dx2, inv_dy2);
-
-                if width > 1 {
-                    update_boundary_cell(&mut input, row, width - 1, inv_dx2, inv_dy2);
-                }
-            }
-        }
-
-        if input.reset_vessels {
-            for idx in 0..grid.len() {
-                if input.vessel_mask[idx] {
-                    input.concentration_next[idx] = input.vessel_concentration[idx];
-                }
+                input.oxygen_next[idx] =
+                    oxygen_center + dt * (oxygen_diffusion - oxygen_consumption);
+                input.carbon_dioxide_next[idx] = carbon_dioxide_center
+                    + dt * (carbon_dioxide_diffusion + co2_yield * oxygen_consumption);
             }
         }
     }
+
+    for col in 0..width {
+        update_gas_exchange_boundary_cell(&mut input, 0, col, inv_dx2, inv_dy2);
+
+        if height > 1 {
+            update_gas_exchange_boundary_cell(&mut input, height - 1, col, inv_dx2, inv_dy2);
+        }
+    }
+
+    if height > 2 {
+        for row in 1..(height - 1) {
+            update_gas_exchange_boundary_cell(&mut input, row, 0, inv_dx2, inv_dy2);
+
+            if width > 1 {
+                update_gas_exchange_boundary_cell(&mut input, row, width - 1, inv_dx2, inv_dy2);
+            }
+        }
+    }
+
+    if input.reset_vessels {
+        for idx in 0..grid.len() {
+            if input.vessel_mask[idx] {
+                input.oxygen_next[idx] = input.vessel_oxygen_concentration[idx];
+                input.carbon_dioxide_next[idx] = input.vessel_carbon_dioxide_concentration[idx];
+            }
+        }
+    }
+}
+/// Compute one face-averaged diffusion stencil for an interior cell.
+#[inline]
+fn diffusion_stencil(
+    center: f32,
+    left: f32,
+    right: f32,
+    up: f32,
+    down: f32,
+    d_center: f32,
+    d_left_cell: f32,
+    d_right_cell: f32,
+    d_up_cell: f32,
+    d_down_cell: f32,
+    inv_dx2: f32,
+    inv_dy2: f32,
+) -> f32 {
+    let d_left = 0.5 * (d_center + d_left_cell);
+    let d_right = 0.5 * (d_center + d_right_cell);
+    let d_up = 0.5 * (d_center + d_up_cell);
+    let d_down = 0.5 * (d_center + d_down_cell);
+
+    d_left * (left - center) * inv_dx2
+        + d_right * (right - center) * inv_dx2
+        + d_up * (up - center) * inv_dy2
+        + d_down * (down - center) * inv_dy2
+}
+/// Update one boundary cell for the coupled O₂/CO₂ gas-exchange model.
+#[inline]
+fn update_gas_exchange_boundary_cell(
+    input: &mut GasExchangeStepInput<'_>,
+    row: usize,
+    col: usize,
+    inv_dx2: f32,
+    inv_dy2: f32,
+) {
+    let grid = input.grid;
+    let width = grid.width;
+    let height = grid.height;
+    let idx = grid.idx(row, col);
+
+    let oxygen_center = input.oxygen_current[idx];
+    let carbon_dioxide_center = input.carbon_dioxide_current[idx];
+    let oxygen_d_center = input.oxygen_diffusivity[idx];
+    let carbon_dioxide_d_center = input.carbon_dioxide_diffusivity[idx];
+
+    let mut oxygen_diffusion = 0.0;
+    let mut carbon_dioxide_diffusion = 0.0;
+
+    if col > 0 {
+        let left_idx = idx - 1;
+
+        let oxygen_d_left = 0.5 * (oxygen_d_center + input.oxygen_diffusivity[left_idx]);
+        oxygen_diffusion +=
+            oxygen_d_left * (input.oxygen_current[left_idx] - oxygen_center) * inv_dx2;
+
+        let carbon_dioxide_d_left =
+            0.5 * (carbon_dioxide_d_center + input.carbon_dioxide_diffusivity[left_idx]);
+        carbon_dioxide_diffusion += carbon_dioxide_d_left
+            * (input.carbon_dioxide_current[left_idx] - carbon_dioxide_center)
+            * inv_dx2;
+    }
+
+    if col + 1 < width {
+        let right_idx = idx + 1;
+
+        let oxygen_d_right = 0.5 * (oxygen_d_center + input.oxygen_diffusivity[right_idx]);
+        oxygen_diffusion +=
+            oxygen_d_right * (input.oxygen_current[right_idx] - oxygen_center) * inv_dx2;
+
+        let carbon_dioxide_d_right =
+            0.5 * (carbon_dioxide_d_center + input.carbon_dioxide_diffusivity[right_idx]);
+        carbon_dioxide_diffusion += carbon_dioxide_d_right
+            * (input.carbon_dioxide_current[right_idx] - carbon_dioxide_center)
+            * inv_dx2;
+    }
+
+    if row > 0 {
+        let up_idx = idx - width;
+
+        let oxygen_d_up = 0.5 * (oxygen_d_center + input.oxygen_diffusivity[up_idx]);
+        oxygen_diffusion += oxygen_d_up * (input.oxygen_current[up_idx] - oxygen_center) * inv_dy2;
+
+        let carbon_dioxide_d_up =
+            0.5 * (carbon_dioxide_d_center + input.carbon_dioxide_diffusivity[up_idx]);
+        carbon_dioxide_diffusion += carbon_dioxide_d_up
+            * (input.carbon_dioxide_current[up_idx] - carbon_dioxide_center)
+            * inv_dy2;
+    }
+
+    if row + 1 < height {
+        let down_idx = idx + width;
+
+        let oxygen_d_down = 0.5 * (oxygen_d_center + input.oxygen_diffusivity[down_idx]);
+        oxygen_diffusion +=
+            oxygen_d_down * (input.oxygen_current[down_idx] - oxygen_center) * inv_dy2;
+
+        let carbon_dioxide_d_down =
+            0.5 * (carbon_dioxide_d_center + input.carbon_dioxide_diffusivity[down_idx]);
+        carbon_dioxide_diffusion += carbon_dioxide_d_down
+            * (input.carbon_dioxide_current[down_idx] - carbon_dioxide_center)
+            * inv_dy2;
+    }
+
+    let oxygen_consumption = michaelis_menten(oxygen_center, input.vmax[idx], input.km[idx]);
+
+    input.oxygen_next[idx] = oxygen_center + input.dt * (oxygen_diffusion - oxygen_consumption);
+    input.carbon_dioxide_next[idx] = carbon_dioxide_center
+        + input.dt * (carbon_dioxide_diffusion + input.co2_yield * oxygen_consumption);
 }
 
 /// Compute Michaelis-Menten oxygen consumption for one cell.
@@ -263,57 +332,6 @@ fn michaelis_menten(concentration: f32, vmax: f32, km: f32) -> f32 {
     }
 }
 
-/// Update a single boundary cell using only neighbors that exist inside the grid.
-///
-/// Boundary cells cannot use the branch-free interior stencil because one or more
-/// neighbors may lie outside the domain. This helper applies the same diffusion and
-/// consumption model as the interior loop, but skips missing neighbors instead of
-/// assuming ghost cells.
-#[inline]
-fn update_boundary_cell(
-    input: &mut FusedStepInput<'_>,
-    row: usize,
-    col: usize,
-    inv_dx2: f32,
-    inv_dy2: f32,
-) {
-    let grid = input.grid;
-    let width = grid.width;
-    let height = grid.height;
-    let idx = grid.idx(row, col);
-
-    let center = input.concentration_current[idx];
-    let d_center = input.diffusivity[idx];
-    let mut diffusion = 0.0;
-
-    if col > 0 {
-        let left_idx = idx - 1;
-        let d_left = 0.5 * (d_center + input.diffusivity[left_idx]);
-        diffusion += d_left * (input.concentration_current[left_idx] - center) * inv_dx2;
-    }
-
-    if col + 1 < width {
-        let right_idx = idx + 1;
-        let d_right = 0.5 * (d_center + input.diffusivity[right_idx]);
-        diffusion += d_right * (input.concentration_current[right_idx] - center) * inv_dx2;
-    }
-
-    if row > 0 {
-        let up_idx = idx - width;
-        let d_up = 0.5 * (d_center + input.diffusivity[up_idx]);
-        diffusion += d_up * (input.concentration_current[up_idx] - center) * inv_dy2;
-    }
-
-    if row + 1 < height {
-        let down_idx = idx + width;
-        let d_down = 0.5 * (d_center + input.diffusivity[down_idx]);
-        diffusion += d_down * (input.concentration_current[down_idx] - center) * inv_dy2;
-    }
-
-    let consumption = michaelis_menten(center, input.vmax[idx], input.km[idx]);
-    input.concentration_next[idx] = center + input.dt * (diffusion - consumption);
-}
-
 // ----------------------------------------------------------------------------
 // Inline Tests
 // ----------------------------------------------------------------------------
@@ -322,45 +340,45 @@ fn update_boundary_cell(
 mod tests {
     use super::*;
 
-    fn reference_input() -> StepInput {
-        let grid = Grid2D::new(3, 3, 1.0, 1.0);
-
-        StepInput {
-            grid,
-            concentration: vec![5.0, 5.0, 5.0, 5.0, 1.0, 5.0, 5.0, 5.0, 5.0],
-            diffusivity: vec![1.0; grid.len()],
-            vmax: vec![0.5; grid.len()],
-            km: vec![1.0; grid.len()],
-            vessel_mask: vec![false, false, false, false, true, false, false, false, false],
-            vessel_concentration: vec![0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0],
-            dt: 0.1,
-            reset_vessels: true,
-        }
-    }
-
     #[test]
-    fn fused_buffered_step_matches_explicit_step() {
-        let input = reference_input();
-        let mut workspace = SolverWorkspace::new(&input);
-        let mut concentration_next = vec![0.0; input.grid.len()];
+    fn gas_exchange_step_consumes_oxygen_and_produces_carbon_dioxide() {
+        let grid = Grid2D::new(3, 3, 1.0, 1.0);
+        let oxygen = vec![5.0; grid.len()];
+        let carbon_dioxide = vec![1.0; grid.len()];
+        let diffusivity = vec![0.0; grid.len()];
+        let vmax = vec![0.5; grid.len()];
+        let km = vec![1.0; grid.len()];
+        let vessel_mask = vec![false; grid.len()];
+        let vessel_oxygen = vec![10.0; grid.len()];
+        let vessel_carbon_dioxide = vec![0.0; grid.len()];
+        let mut oxygen_next = vec![0.0; grid.len()];
+        let mut carbon_dioxide_next = vec![0.0; grid.len()];
 
-        workspace.explicit_step_fused(FusedStepInput {
-            grid: input.grid,
-            concentration_current: &input.concentration,
-            concentration_next: &mut concentration_next,
-            diffusivity: &input.diffusivity,
-            vmax: &input.vmax,
-            km: &input.km,
-            vessel_mask: &input.vessel_mask,
-            vessel_concentration: &input.vessel_concentration,
-            dt: input.dt,
-            reset_vessels: input.reset_vessels,
+        explicit_gas_exchange_step_fused(GasExchangeStepInput {
+            grid,
+            oxygen_current: &oxygen,
+            carbon_dioxide_current: &carbon_dioxide,
+            oxygen_next: &mut oxygen_next,
+            carbon_dioxide_next: &mut carbon_dioxide_next,
+            oxygen_diffusivity: &diffusivity,
+            carbon_dioxide_diffusivity: &diffusivity,
+            vmax: &vmax,
+            km: &km,
+            vessel_mask: &vessel_mask,
+            vessel_oxygen_concentration: &vessel_oxygen,
+            vessel_carbon_dioxide_concentration: &vessel_carbon_dioxide,
+            dt: 0.1,
+            co2_yield: 1.0,
+            reset_vessels: false,
         });
 
-        let output = explicit_step(&input);
+        let expected_consumption = 0.5 * 5.0 / (1.0 + 5.0);
+        let expected_oxygen = 5.0 - 0.1 * expected_consumption;
+        let expected_carbon_dioxide = 1.0 + 0.1 * expected_consumption;
 
-        for (direct, fused) in output.iter().zip(concentration_next.iter()) {
-            assert!((direct - fused).abs() < 1e-6);
+        for idx in 0..grid.len() {
+            assert!((oxygen_next[idx] - expected_oxygen).abs() < 1e-6);
+            assert!((carbon_dioxide_next[idx] - expected_carbon_dioxide).abs() < 1e-6);
         }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "gpu_solver"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 
 [lib]
@@ -15,7 +15,7 @@ pollster = "0.4"
 # Buffer serialization
 bytemuck = { version = "1.23", features = ["derive"] }
 
-# Array handling (temporary, CPU validation)
+# Array handling and NumPy interoperability
 ndarray = "0.17.2"
 
 # Error handling

@@ -4,7 +4,7 @@ A computational framework for simulating molecular diffusion and transport in bi
 
 ## Overview
 
-Transport phenomena govern oxygen delivery, nutrient exchange, and drug penetration in biological tissues. This project aims to simulate these processes numerically using discretized diffusion equations and customizable tissue properties.
+Transport phenomena govern oxygen delivery, carbon dioxide removal, nutrient exchange, and drug penetration in biological tissues. This project aims to simulate these processes numerically using discretized reaction-diffusion equations, heterogeneous tissue properties, and realistic vascular architectures extracted from biological images.
 
 Current implementation includes:
 
@@ -18,23 +18,30 @@ Current implementation includes:
 - Flux and flux divergence calculations
 - Species-specific transport properties
 - Michaelis-Menten oxygen consumption
+- Physiological oxygen transport assumptions
+- Coupled oxygen (O₂) and carbon dioxide (CO₂) transport
+- Carbon dioxide production coupled to oxygen consumption
+- Vessels acting as O₂ sources and CO₂ sinks
+- Validation against CPU reference implementations
 - GPU acceleration
 - GIF generation for diffusion dynamics
 - Parameter sensitivity analysis
 
 Future goals:
 
+- Machine learning vessel segmentation from microscopy or histology images
+- Automated estimation of porosity and tortuosity from segmented tissue
 - Blood flow and advection
 - Vessel wall permeability
-- 3D tissue domains
-- Multi-species transport
-- Reaction-diffusion systems
-- Visualization/interactive simulations
 - Vessel radius-dependent oxygen delivery
+- Hypoxia/anoxia detection
 - Coupled angiogenesis and hypoxia models
-- Adaptive mesh refinement
+- Dynamic vascular remodeling
 - Hemodynamic flow coupling
+- 3D tissue domains
 - 3D GPU acceleration
+- Adaptive mesh refinement
+- Visualization and interactive simulations
 - Experimental parameter fitting against biological data
 
 ---
@@ -104,7 +111,7 @@ python -c "import gpu_solver; print(gpu_solver)"
 If the import succeeds, the Python side can call the Rust/WGPU solver through:
 
 ```python
-gpu_solver.run_steps_auto_numpy(...)
+gpu_solver.run_gas_exchange_steps_auto_numpy(...)
 ```
 
 ---
@@ -121,10 +128,9 @@ This will:
 
 - load and preprocess the vessel image
 - create the tissue domain
-- run oxygen diffusion and consumption through the Rust/WGPU solver
-- save the diffusion animation as `oxygen_diffusion.gif`
-- run the Michaelis-Menten parameter sweep
-- save the parameter sweep as `parameter_sweep.png`
+- simulate coupled O₂ diffusion, CO₂ production, and metabolism through the Rust/WGPU solver
+- treat vessels as persistent O₂ sources and CO₂ sinks
+- save diffusion visualizations and final concentration maps
 
 The main simulation uses chunked GPU execution. Instead of returning to Python every timestep, many intermediate timesteps stay inside Rust/GPU memory before a sampled frame is returned for plotting or GIF generation.
 
@@ -230,6 +236,15 @@ which creates biologically realistic steady-state oxygen gradients around vascul
 
 ---
 
+## Long-Term Vision
+
+The long-term objective of TissueTransport is to evolve from a diffusion simulator into a GPU-accelerated computational physiology framework capable of simulating coupled gas exchange, metabolism, vascular adaptation, and biologically realistic tissue transport using vascular networks extracted directly from imaging data.
+
+Planned biological extensions include angiogenesis,
+dynamic vascular remodeling, and machine learning-based vessel segmentation from microscopy images.
+
+---
+
 ## Modeling Assumptions
 
 Current simulations assume:
@@ -241,6 +256,8 @@ Current simulations assume:
 - Blood flow and advection are neglected
 - Diffusion is isotropic within local tissue regions
 - Tissue metabolism follows Michaelis-Menten kinetics
+- Carbon dioxide is produced proportionally to oxygen consumption
+- Vascular geometry is currently extracted using image-processing heuristics rather than learned segmentation models
 
 ---
 
@@ -269,6 +286,23 @@ Observed behavior:
 - Hypoxic regions in poorly vascularized tissue
 - Emergence of steady-state concentration gradients
 - Competition between diffusion and metabolic consumption
+
+---
+
+## Coupled Oxygen and Carbon Dioxide Transport
+
+The current solver advances oxygen and carbon dioxide simultaneously. Oxygen is consumed through Michaelis-Menten metabolism while carbon dioxide is generated as a metabolic byproduct. Vessel regions act as fixed oxygen sources and carbon dioxide sinks.
+
+The visualization below shows steady-state coupled gas transport after long simulation times.
+
+![Coupled O2 and CO2 transport](gas_exchange_final.png)
+
+Observed behavior:
+
+- Oxygen remains elevated near vessel regions and depleted in poorly perfused tissue
+- Carbon dioxide accumulates where oxygen consumption is sustained
+- Vascular regions remain low in CO₂ due to sink boundary conditions
+- Emergent gradients arise from coupled metabolism and diffusion rather than diffusion alone
 
 ---
 

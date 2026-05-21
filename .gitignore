@@ -28,6 +28,7 @@ Cargo.lock
 .pytest_cache/
 .coverage
 htmlcov/
+simulation/gpu_solver/test_data/reference_case.json
 
 # IDEs
 .vscode/
