@@ -26,10 +26,10 @@ Current implementation includes:
 - GPU acceleration
 - GIF generation for diffusion dynamics
 - Parameter sensitivity analysis
+- Machine learning-based vessel segmentation through the standalone VeSeg package
 
 Future goals:
 
-- Machine learning vessel segmentation from microscopy or histology images
 - Automated estimation of porosity and tortuosity from segmented tissue
 - Blood flow and advection
 - Vessel wall permeability
@@ -64,6 +64,7 @@ Python dependencies include:
 - `matplotlib`
 - `tqdm`
 - `pillow`
+- `veseg` (machine learning-based vascular segmentation)
 
 Install Python dependencies inside a virtual environment:
 
@@ -71,6 +72,7 @@ Install Python dependencies inside a virtual environment:
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install numpy matplotlib tqdm pillow maturin
+python -m pip install git+https://github.com/HARDIntegral/VeSeg.git
 ```
 
 On macOS or Linux, the virtual environment should appear in the terminal prompt before running the project:
@@ -78,6 +80,60 @@ On macOS or Linux, the virtual environment should appear in the terminal prompt 
 ```bash
 (.venv)
 ```
+
+VeSeg is installed separately because TissueTransport uses pretrained U-Net vessel segmentation before transport simulation:
+
+```bash
+python -m pip install git+https://github.com/HARDIntegral/VeSeg.git
+```
+
+This provides:
+
+```text
+vascular image
+↓
+VeSeg segmentation
+↓
+binary vessel mask
+↓
+TissueTransport diffusion domain
+```
+
+---
+
+## VeSeg Integration
+
+TissueTransport now integrates directly with **[VeSeg](https://github.com/HARDIntegral/VeSeg)**, a standalone installable Python package for machine learning-based vascular segmentation.
+
+Pipeline:
+
+```text
+Raw vascular image
+↓
+VeSeg (U-Net inference)
+↓
+Binary vessel mask
+↓
+Upscaling to simulation resolution
+↓
+GPU reaction-diffusion solver
+↓
+Coupled O₂ / CO₂ transport
+```
+
+This removes dependence on handcrafted thresholding pipelines and allows biologically realistic vessel structures extracted from microscopy or histology images to act as transport boundary conditions.
+
+The current workflow:
+
+```text
+Microscopy / vessel image
+→ VeSeg segmentation
+→ Binary vascular mask
+→ TissueTransport simulation domain
+→ GPU accelerated O₂ / CO₂ transport
+```
+
+VeSeg masks become fixed vascular source regions inside the transport solver, allowing learned vascular geometry to directly influence emergent oxygen gradients, carbon dioxide accumulation, and hypoxic regions.
 
 ---
 
@@ -126,7 +182,7 @@ python simulation/main.py
 
 This will:
 
-- load and preprocess the vessel image
+- load a vascular image and generate vessel masks using the VeSeg segmentation package
 - create the tissue domain
 - simulate coupled O₂ diffusion, CO₂ production, and metabolism through the Rust/WGPU solver
 - treat vessels as persistent O₂ sources and CO₂ sinks
@@ -238,7 +294,7 @@ which creates biologically realistic steady-state oxygen gradients around vascul
 
 ## Long-Term Vision
 
-The long-term objective of TissueTransport is to evolve from a diffusion simulator into a GPU-accelerated computational physiology framework capable of simulating coupled gas exchange, metabolism, vascular adaptation, and biologically realistic tissue transport using vascular networks extracted directly from imaging data.
+The long-term objective of TissueTransport is to evolve from a diffusion simulator into a GPU-accelerated computational physiology framework capable of simulating coupled gas exchange, metabolism, vascular adaptation, and biologically realistic tissue transport using vascular networks extracted directly from imaging data. The current workflow already integrates the standalone VeSeg machine learning package to segment vascular structures before transport simulation.
 
 Planned biological extensions include angiogenesis,
 dynamic vascular remodeling, and machine learning-based vessel segmentation from microscopy images.
@@ -257,13 +313,13 @@ Current simulations assume:
 - Diffusion is isotropic within local tissue regions
 - Tissue metabolism follows Michaelis-Menten kinetics
 - Carbon dioxide is produced proportionally to oxygen consumption
-- Vascular geometry is currently extracted using image-processing heuristics rather than learned segmentation models
+- Vascular geometry is generated through VeSeg, a pretrained U-Net segmentation package for vessel extraction
 
 ---
 
 ## Oxygen Diffusion Dynamics
 
-The animation below shows oxygen diffusing outward from segmented blood vessels into surrounding tissue while metabolism continuously removes oxygen.
+The animation below shows oxygen diffusing outward from blood vessels segmented by VeSeg (U-Net based vascular segmentation) while metabolism continuously removes oxygen. VeSeg-generated masks are upscaled to simulation resolution and used as fixed vascular source regions.
 
 <table>
 <tr>
@@ -376,4 +432,20 @@ Validation process:
 	- Warmup runs were excluded to remove one-time initialization costs
 	- Variability, standard deviation, and average speedups were recorded across repeated runs
 
-This workflow helps ensure that performance gains do not come at the expense of physical correctness. The original reference solver remains part of the project as validation infrastructure rather than being discarded after optimization.
+
+---
+
+## Related Projects
+
+- **[VeSeg](https://github.com/HARDIntegral/VeSeg)**
+  - Standalone machine learning package for vascular segmentation
+  - Uses pretrained U-Net inference to generate binary vessel masks from microscopy or vascular images
+  - Integrated into TissueTransport as the vascular preprocessing and source-region generation pipeline
+
+---
+
+## License
+
+This project is distributed under the MIT License.
+
+See the [LICENSE](LICENSE) file for additional details regarding permissions, limitations, and usage.

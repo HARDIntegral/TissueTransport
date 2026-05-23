@@ -5,7 +5,7 @@ import numpy as np
 import gpu_solver
 from domain import TissueDomain
 from species import Oxygen
-from image_processing import load_image_rgb, threshold_vessels, remove_stray_pixels, smooth_image
+import veseg
 
 
 # Convert arrays into a format that the Rust/PyO3 interface can accept safely.
@@ -58,6 +58,7 @@ def rust_reaction_diffusion_steps(concentration, arrays, steps, dt):
 		True,
 	)
 
+
 # Create the tissue domain and initialize uniform tissue properties.
 shape = (1000, 1000)
 scale = (1e-3, 1e-3)
@@ -65,15 +66,13 @@ test_domain = TissueDomain(shape, scale)
 test_domain.set_uniform_properties(epsilon=0.3, tau=2.0, mu=0.001)
 test_domain.set_initial_concentration(0.0)
 
-# Load the vessel image and convert it into a clean binary vessel mask.
-image = load_image_rgb(
-	"blood_vessel_network_images/structure3.png",
-	shape,
-	5.0
+# Generate vessel mask with VeSeg and upscale to simulation resolution.
+veseg_result = veseg.predict(
+	path="blood_vessel_network_images/structure3.png",
+	mode=veseg.ENHANCED_INVERTED,
 )
-image = smooth_image(image, 1)
-mask = threshold_vessels(image)
-mask = remove_stray_pixels(mask, 2)
+raw_mask = veseg_result.despeckle(min_neighbors=2).mask.astype(bool)
+mask = veseg.resize_mask(raw_mask, size=(shape[1], shape[0])).astype(bool)
 
 # Use the vessel mask as fixed oxygen sources and set tissue consumption.
 test_domain.set_vessel_mask(mask, 1.0)
@@ -114,6 +113,7 @@ frames.append(test_domain.concentration.copy())
 frame_steps.append(0)
 
 # Configure the physical simulation time and how often frames are sampled.
+# Smaller grids can safely use a larger timestep while preserving the same 10 second simulated duration.
 simulation_dt = 0.0001
 simulation_time = 10.0
 total_steps = int(simulation_time / simulation_dt)
@@ -148,7 +148,6 @@ for step in tqdm(
 
 plt.ioff()
 
-# Save the final O2/CO2 state for documentation or README images.
 fig.savefig(
 	"gas_exchange_final.png",
 	dpi=300,
