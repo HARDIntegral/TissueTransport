@@ -4,45 +4,40 @@ A computational framework for simulating molecular diffusion and transport in bi
 
 ## Overview
 
-Transport phenomena govern oxygen delivery, carbon dioxide removal, nutrient exchange, and drug penetration in biological tissues. This project aims to simulate these processes numerically using discretized reaction-diffusion equations, heterogeneous tissue properties, and realistic vascular architectures extracted from biological images.
+Biological function depends on transport. Oxygen delivery, carbon dioxide removal, nutrient exchange, drug penetration, and tissue survival emerge from interactions between vascular architecture, diffusion, metabolism, and flow. Small differences in vessel structure can create drastically different local microenvironments, including hypoxic or anoxic regions that influence tissue behavior.
 
-Current implementation includes:
+TissueTransport aims to model these processes computationally using GPU-accelerated reaction-diffusion simulations, segmented vascular structures, and biologically motivated transport assumptions. The long-term objective is to move beyond static diffusion simulations toward dynamic vascular remodeling, where hypoxic regions drive angiogenesis and new capillary growth alters transport behavior over time.
 
-- 2D diffusion simulation
-- Spatially varying effective diffusivity
-- Tissue porosity ($\epsilon$) effects
-- Tortuosity ($\tau$) effects
-- Temperature-dependent diffusivity
-- Fixed vascular concentration sources
-- Explicit finite difference time stepping
-- Flux and flux divergence calculations
-- Species-specific transport properties
-- Michaelis-Menten oxygen consumption
-- Physiological oxygen transport assumptions
-- Coupled oxygen (O₂) and carbon dioxide (CO₂) transport
-- Carbon dioxide production coupled to oxygen consumption
-- Vessels acting as O₂ sources and CO₂ sinks
-- Validation against CPU reference implementations
-- GPU acceleration
-- GIF generation for diffusion dynamics
-- Parameter sensitivity analysis
-- Machine learning-based vessel segmentation through the standalone VeSeg package
+Current workflow:
 
-Future goals:
+```text
+Vascular image
+↓
+VeSeg segmentation
+↓
+Binary vessel mask
+↓
+Coupled O₂ / CO₂ transport
+↓
+Hypoxia / anoxia emergence
+↓
+Future: angiogenic remodeling
+```
 
-- Automated estimation of porosity and tortuosity from segmented tissue
+Current implementation:
+
+- Coupled O₂/CO₂ transport with metabolism
+- GPU-accelerated reaction-diffusion solving
+- VeSeg vascular segmentation integration
+- Hypoxia visualization and sensitivity analysis
+- Validation against CPU reference solvers
+
+Long-term goals:
+
 - Blood flow and advection
-- Vessel wall permeability
-- Vessel radius-dependent oxygen delivery
-- Hypoxia/anoxia detection
-- Coupled angiogenesis and hypoxia models
+- Angiogenesis and capillary sprouting
 - Dynamic vascular remodeling
-- Hemodynamic flow coupling
-- 3D tissue domains
-- 3D GPU acceleration
-- Adaptive mesh refinement
-- Visualization and interactive simulations
-- Experimental parameter fitting against biological data
+- Coupled hemodynamics and transport
 
 ---
 
@@ -317,31 +312,31 @@ Current simulations assume:
 
 ---
 
-## Oxygen Diffusion Dynamics
+## Diffusion Dynamics
 
-The animation below shows oxygen diffusing outward from blood vessels segmented by VeSeg (U-Net based vascular segmentation) while metabolism continuously removes oxygen. VeSeg-generated masks are upscaled to simulation resolution and used as fixed vascular source regions.
+The visualizations below show how concentration gradients emerge over time from the interaction between vascular geometry, diffusion, and metabolic consumption. Vessel masks generated through VeSeg act as fixed source regions, while transport and consumption shape spatial heterogeneity throughout the tissue.
 
 <table>
 <tr>
 <td align="center"><b>Original vessel structure</b></td>
-<td align="center"><b>Oxygen diffusion over time</b></td>
+<td align="center"><b>Transport dynamics over time</b></td>
 </tr>
 <tr>
 <td>
 <img src="blood_vessel_network_images/structure3.png" width="300">
 </td>
 <td>
-<img src="oxygen_diffusion.gif" width="500">
+<img src="gas_exchange_composite.png" width="500">
 </td>
 </tr>
 </table>
 
 Observed behavior:
 
-- High oxygen concentration near vessels
-- Hypoxic regions in poorly vascularized tissue
-- Emergence of steady-state concentration gradients
-- Competition between diffusion and metabolic consumption
+- Strong concentration gradients emerge around vascular regions
+- Poorly perfused regions develop depletion zones over time
+- Spatial heterogeneity arises directly from vessel architecture
+- Steady-state behavior reflects competition between diffusion, consumption, and source replenishment
 
 ---
 
@@ -359,6 +354,19 @@ Observed behavior:
 - Carbon dioxide accumulates where oxygen consumption is sustained
 - Vascular regions remain low in CO₂ due to sink boundary conditions
 - Emergent gradients arise from coupled metabolism and diffusion rather than diffusion alone
+
+The comparison below shows steady-state coupled gas exchange across three different segmented vascular structures. Differences in vessel density, branching, and spatial distribution produce distinct oxygen penetration depths, carbon dioxide accumulation patterns, and hypoxic regions.
+
+![Gas exchange comparison across vascular structures](gas_exchange_structure_comparison.png)
+
+Observed behavior:
+
+- Denser vascular networks maintain broader oxygenated regions
+- Sparse or uneven vascular distributions produce larger hypoxic zones
+- Carbon dioxide accumulation depends on both metabolism and local oxygen availability
+- Transport behavior emerges from vascular morphology rather than diffusion alone
+
+Note: Oxygen concentrations remain dominant near vascular regions because vessels are modeled as fixed concentration sources, continuously replenishing O₂ at each timestep. In contrast, CO₂ is generated indirectly through metabolic consumption and lacks a persistent source term, causing accumulation patterns to emerge farther from vessel boundaries despite local production rates increasing with oxygen availability.
 
 ---
 
