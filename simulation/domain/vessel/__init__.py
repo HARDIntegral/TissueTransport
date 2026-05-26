@@ -1,22 +1,22 @@
-# domain/__init__.py
+# domain/vessel/__init__.py
 
-"""Core simulation domain objects."""
+"""Vessel domain models and vascular transport helpers."""
 
-# Convenience re-exports for common simulation entry points.
-from .tissue import TissueDomain
-from .vessel import (
-	# vessel models
+from .network import (
 	VesselNetwork,
 	VesselNode,
 	VesselSegment,
+)
 
-	# flow
+# Re-export common vascular constants for convenience.
+from .constants import *
+from .flow import (
 	FlowSolution,
 	SegmentFlow,
 	solve_network_flow,
 	solve_network_flow_mmhg,
-
-	# transport
+)
+from .transport import (
 	BoundarySourceMaps,
 	SegmentConcentration,
 	assign_flow_weighted_segment_concentrations,
@@ -27,10 +27,7 @@ from .vessel import (
 )
 
 __all__ = [
-	# tissue
-	"TissueDomain",
-
-	# vessel models
+	# models
 	"VesselNetwork",
 	"VesselNode",
 	"VesselSegment",

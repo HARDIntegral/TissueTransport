@@ -1,5 +1,7 @@
+from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
+from matplotlib.collections import LineCollection
 from tqdm import tqdm
 import numpy as np
 import gpu_solver
@@ -12,6 +14,167 @@ import veseg
 def _rust_array(value, dtype):
 	"""Convert a value into a real C-contiguous NumPy array for PyO3/numpy."""
 	return np.ascontiguousarray(np.asarray(value, dtype=dtype))
+
+
+# Scale graph node coordinates and edge length/radius values into the simulation grid.
+def scale_vessel_geometry(nodes, edges, source_shape, target_shape):
+	"""Scale VeSeg graph geometry from segmentation pixels into simulation pixels."""
+	source_h, source_w = source_shape
+	target_h, target_w = target_shape
+
+	row_scale = target_h / source_h
+	col_scale = target_w / source_w
+	radius_scale = 0.5 * (row_scale + col_scale)
+
+	scaled_nodes = np.array(nodes, dtype=np.float32, copy=True)
+	scaled_edges = np.array(edges, dtype=np.float32, copy=True)
+
+	# Node table columns: [node_id, row, col, node_type].
+	if scaled_nodes.size > 0:
+		scaled_nodes[:, 1] *= row_scale
+		scaled_nodes[:, 2] *= col_scale
+
+	# Edge table columns:
+	# [edge_id, start_node, end_node, length_px, mean_radius, min_radius, max_radius, normalized_radius].
+	if scaled_edges.size > 0:
+		scaled_edges[:, 3] *= radius_scale
+		scaled_edges[:, 4] *= radius_scale
+		scaled_edges[:, 5] *= radius_scale
+		scaled_edges[:, 6] *= radius_scale
+
+	return scaled_nodes, scaled_edges
+
+
+# Save VeSeg geometry outputs so later flow/transport code can reuse them directly.
+def save_vessel_geometry(output_path, raw_mask, skeleton, distance_map, reconstructed_mask, scaled_skeleton, scaled_distance_map, scaled_reconstructed_mask, simulation_mask, nodes, edges, scaled_nodes, scaled_edges):
+	"""Save raw and simulation-scaled vessel geometry arrays to one compressed file."""
+	output_path = Path(output_path)
+	output_path.parent.mkdir(parents=True, exist_ok=True)
+
+	np.savez_compressed(
+		output_path,
+		raw_mask=raw_mask.astype(bool),
+		skeleton=skeleton.astype(bool),
+		distance_map=distance_map.astype(np.float32),
+		reconstructed_mask=reconstructed_mask.astype(bool),
+		scaled_skeleton=scaled_skeleton.astype(bool),
+		scaled_distance_map=scaled_distance_map.astype(np.float32),
+		scaled_reconstructed_mask=scaled_reconstructed_mask.astype(bool),
+		simulation_mask=simulation_mask.astype(bool),
+		nodes=nodes.astype(np.float32),
+		edges=edges.astype(np.float32),
+		scaled_nodes=scaled_nodes.astype(np.float32),
+		scaled_edges=scaled_edges.astype(np.float32),
+	)
+
+
+# Crop or pad a scaled mask so it exactly matches the simulation domain shape.
+def fit_mask_to_shape(mask, target_shape):
+	"""Fit a binary mask to the target simulation shape without resampling again."""
+	target_h, target_w = target_shape
+	fitted = np.zeros(target_shape, dtype=bool)
+
+	copy_h = min(mask.shape[0], target_h)
+	copy_w = min(mask.shape[1], target_w)
+
+	fitted[:copy_h, :copy_w] = mask[:copy_h, :copy_w]
+	return fitted
+
+
+# Scale the centerline/radius representation first, then reconstruct at simulation resolution.
+def scale_skeleton_distance_for_reconstruction(skeleton, distance_map, source_shape, target_shape):
+	"""Scale VeSeg skeleton + radius data before reconstruction to avoid blocky mask scaling."""
+	source_h, source_w = source_shape
+	target_h, target_w = target_shape
+
+	row_scale = target_h / source_h
+	col_scale = target_w / source_w
+	radius_scale = 0.5 * (row_scale + col_scale)
+
+	scaled_skeleton = np.zeros(target_shape, dtype=bool)
+	scaled_distance_map = np.zeros(target_shape, dtype=np.float32)
+
+	rows, cols = np.nonzero(skeleton)
+
+	for row, col in zip(rows, cols):
+		target_row = min(int(round(row * row_scale)), target_h - 1)
+		target_col = min(int(round(col * col_scale)), target_w - 1)
+
+		scaled_skeleton[target_row, target_col] = True
+		scaled_distance_map[target_row, target_col] = max(
+			scaled_distance_map[target_row, target_col],
+			float(distance_map[row, col]) * radius_scale,
+		)
+
+	return scaled_skeleton, scaled_distance_map
+
+
+# Plot the extracted vessel graph, with each edge colored by mean radius.
+def plot_radius_colored_graph(nodes, edges, vessel_mask):
+	"""Render the scaled vessel graph and color edges by mean radius."""
+	fig, ax = plt.subplots(1, 1, figsize=(7, 7))
+	ax.imshow(vessel_mask, cmap="gray", alpha=0.18)
+
+	if nodes.size == 0 or edges.size == 0:
+		ax.set_title("Vessel graph + radii | no graph data")
+		ax.axis("off")
+		plt.close(fig)
+		return
+
+	# Node table columns: [node_id, row, col, node_type].
+	node_lookup = {
+		int(node[0]): (float(node[2]), float(node[1]))
+		for node in nodes
+	}
+
+	segments = []
+	radii = []
+	line_widths = []
+
+	for edge in edges:
+		start_id = int(edge[1])
+		end_id = int(edge[2])
+
+		if start_id not in node_lookup or end_id not in node_lookup:
+			continue
+
+		mean_radius = float(edge[4])
+		segments.append([node_lookup[start_id], node_lookup[end_id]])
+		radii.append(mean_radius)
+		line_widths.append(max(1.0, 0.35 * mean_radius))
+
+	if not segments:
+		ax.set_title("Vessel graph + radii | no drawable edges")
+		ax.axis("off")
+		plt.close(fig)
+		return
+
+	collection = LineCollection(
+		segments,
+		array=np.asarray(radii, dtype=np.float32),
+		cmap="viridis",
+		linewidths=line_widths,
+		alpha=0.95,
+	)
+
+	ax.add_collection(collection)
+	ax.scatter(
+		nodes[:, 2],
+		nodes[:, 1],
+		s=8,
+		c="black",
+		alpha=0.75,
+		label="Graph nodes",
+	)
+
+	colorbar = fig.colorbar(collection, ax=ax, fraction=0.046, pad=0.04)
+	colorbar.set_label("Mean vessel radius (simulation pixels)")
+
+	ax.set_title("Structure 3 vessel graph colored by radius")
+	ax.set_xlim(0, vessel_mask.shape[1])
+	ax.set_ylim(vessel_mask.shape[0], 0)
+	ax.set_aspect("equal")
+	ax.axis("off")
 
 
 # Combine oxygen, carbon dioxide, anoxia, and vessels into one RGBA frame.
@@ -107,8 +270,8 @@ def rust_reaction_diffusion_steps(concentration, arrays, steps, dt):
 
 
 # Build one tissue domain from one vessel structure image.
-def create_domain_from_structure(structure_path, shape, scale):
-	"""Create a tissue domain and vessel mask from one vessel structure image."""
+def create_domain_from_structure(structure_path, structure_name, shape, scale):
+	"""Create a tissue domain, vessel mask, and saved VeSeg graph geometry."""
 	domain = TissueDomain(shape, scale)
 	domain.set_uniform_properties(epsilon=0.3, tau=2.0, mu=0.001)
 	domain.set_initial_concentration(0.0)
@@ -117,19 +280,82 @@ def create_domain_from_structure(structure_path, shape, scale):
 		path=structure_path,
 		mode=veseg.ENHANCED_INVERTED,
 	)
-	raw_mask = veseg_result.despeckle(min_neighbors=2).mask.astype(bool)
-	mask = veseg.resize_mask(raw_mask, size=(shape[1], shape[0])).astype(bool)
 
-	domain.set_vessel_mask(mask, 1.0)
+	# Start with VeSeg's postprocessed prediction mask.
+	raw_mask = veseg_result.despeckle(min_neighbors=2).mask.astype(bool)
+
+	# Extract reusable graph geometry at the native VeSeg mask resolution.
+	geometry_mask, skeleton, distance_map, nodes, edges = veseg.extract_vessel_geometry(raw_mask)
+
+	# Keep the native-resolution reconstruction for saved geometry/debugging.
+	reconstructed_mask = veseg.reconstruct_vessel_mask(skeleton, distance_map).astype(bool)
+
+	# For the simulation mask, scale the centerline + radius data first and reconstruct at
+	# simulation resolution. This avoids magnifying a low-resolution binary mask, which is
+	# what makes vessels look blocky.
+	scaled_skeleton, scaled_distance_map = scale_skeleton_distance_for_reconstruction(
+		skeleton,
+		distance_map,
+		source_shape=geometry_mask.shape,
+		target_shape=shape,
+	)
+
+	scaled_reconstructed_mask = veseg.reconstruct_vessel_mask(
+		scaled_skeleton,
+		scaled_distance_map,
+	).astype(bool)
+
+	simulation_mask = fit_mask_to_shape(
+		scaled_reconstructed_mask,
+		shape,
+	)
+
+	# Scale node coordinates and edge length/radius columns into simulation-pixel units.
+	scaled_nodes, scaled_edges = scale_vessel_geometry(
+		nodes,
+		edges,
+		source_shape=geometry_mask.shape,
+		target_shape=shape,
+	)
+
+	safe_name = structure_name.lower().replace(" ", "_")
+	save_vessel_geometry(
+		Path("vessel_geometry") / f"{safe_name}_geometry.npz",
+		geometry_mask,
+		skeleton,
+		distance_map,
+		reconstructed_mask,
+		scaled_skeleton,
+		scaled_distance_map,
+		scaled_reconstructed_mask,
+		simulation_mask,
+		nodes,
+		edges,
+		scaled_nodes,
+		scaled_edges,
+	)
+
+	domain.set_vessel_mask(simulation_mask, 1.0)
 	domain.set_uniform_consumption(vmax=0.05, km=0.05)
 
-	return domain, mask
+	return domain, simulation_mask, scaled_nodes, scaled_edges
 
 
 # Run one full gas-exchange simulation for one vessel structure.
 def run_structure_simulation(structure_path, structure_name, ax, shape, scale, oxygen):
 	"""Run one simulation and draw the final composite frame on one axis."""
-	domain, mask = create_domain_from_structure(structure_path, shape, scale)
+	domain, mask, nodes, edges = create_domain_from_structure(
+		structure_path,
+		structure_name,
+		shape,
+		scale
+	)
+	print(f"{structure_name}: saved {nodes.shape[0]} nodes and {edges.shape[0]} radius-annotated edges")
+	plot_radius_colored_graph(
+		nodes,
+		edges,
+		mask
+	)
 	rust_arrays = prepare_rust_solver_arrays(domain, oxygen)
 
 	visual_frame = make_overlay_frame(
@@ -179,26 +405,24 @@ frame_interval_steps = max(1, total_steps // target_frames)
 oxygen = Oxygen()
 
 structures = [
-	("blood_vessel_network_images/structure1.png", "Structure 1"),
-	("blood_vessel_network_images/structure2.png", "Structure 2"),
 	("blood_vessel_network_images/structure3.png", "Structure 3"),
 ]
 
 plt.ion()
 
-# Draw all three vessel structures side-by-side in one row.
-fig, axes = plt.subplots(1, 3, figsize=(15, 6))
-fig.suptitle(f"Gas exchange comparison | dt = {simulation_dt}", fontsize=14)
+# Draw only Structure 3 for the current VeSeg geometry workflow.
+fig, ax = plt.subplots(1, 1, figsize=(7, 7))
+fig.suptitle(f"Gas exchange simulation | dt = {simulation_dt}", fontsize=14)
 
-for ax, (structure_path, structure_name) in zip(axes, structures):
-	run_structure_simulation(
-		structure_path,
-		structure_name,
-		ax,
-		shape,
-		scale,
-		oxygen
-	)
+structure_path, structure_name = structures[0]
+run_structure_simulation(
+	structure_path,
+	structure_name,
+	ax,
+	shape,
+	scale,
+	oxygen
+)
 
 legend_elements = [
 	Patch(
@@ -222,24 +446,24 @@ legend_elements = [
 fig.legend(
 	handles=legend_elements,
 	loc="lower center",
+	bbox_to_anchor=(0.5, 0.045),
 	ncol=2,
 	frameon=True,
 	fontsize=8,
 	title="Visualization legend",
-	bbox_to_anchor=(0.5, 0.05),
 )
 
 plt.ioff()
 plt.subplots_adjust(
-	left=0.03,
+	left=0.07,
 	right=0.97,
-	bottom=0.18,
+	bottom=0.23,
 	top=0.88,
 	wspace=0.03
 )
 
 fig.savefig(
-	"gas_exchange_structure_comparison.png",
+	"gas_exchange_structure3.png",
 	dpi=300,
 	bbox_inches="tight"
 )
