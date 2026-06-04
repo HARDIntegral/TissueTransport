@@ -1,0 +1,15 @@
+[package]
+name = "vessel_solver"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "vessel_solver"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.28.3", features = ["extension-module"], optional = true }
+
+[features]
+default = []
+python = ["pyo3"]

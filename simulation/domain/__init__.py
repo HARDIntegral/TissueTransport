@@ -1,52 +1,58 @@
 # domain/__init__.py
 
-"""Core simulation domain objects."""
-
-# Convenience re-exports for common simulation entry points.
 from .tissue import TissueDomain
 from .vessel import (
-	# vessel models
-	VesselNetwork,
+	VesselGeometryResult,
+	VesselTransportResult,
+
 	VesselNode,
 	VesselSegment,
+	VesselNetwork,
 
-	# flow
-	FlowSolution,
-	SegmentFlow,
-	solve_network_flow,
-	solve_network_flow_mmhg,
-
-	# transport
-	BoundarySourceMaps,
 	SegmentConcentration,
-	assign_flow_weighted_segment_concentrations,
-	assign_uniform_segment_concentrations,
-	build_boundary_concentration_maps,
-	build_boundary_source_maps,
+	BoundarySourceMaps,
+
+	DEFAULT_BLOOD_VISCOSITY_PA_S,
+	DEFAULT_INLET_PRESSURE_MMHG,
+	DEFAULT_OUTLET_PRESSURE_MMHG,
+
+	build_vessel_geometry,
+	build_vessel_transport_pipeline,
+	build_vessel_transport_pipeline_from_image,
+
+	build_centerline_mask,
+	build_segment_pixel_map,
+	build_vessel_mask,
+
+	summarize_segment_concentrations,
 	summarize_boundary_sources,
 )
 
 __all__ = [
-	# tissue
 	"TissueDomain",
 
-	# vessel models
-	"VesselNetwork",
+	"VesselGeometryResult",
+	"VesselTransportResult",
+
 	"VesselNode",
 	"VesselSegment",
+	"VesselNetwork",
 
-	# flow
-	"FlowSolution",
-	"SegmentFlow",
-	"solve_network_flow",
-	"solve_network_flow_mmhg",
-
-	# transport
-	"BoundarySourceMaps",
 	"SegmentConcentration",
-	"assign_uniform_segment_concentrations",
-	"assign_flow_weighted_segment_concentrations",
-	"build_boundary_source_maps",
-	"build_boundary_concentration_maps",
+	"BoundarySourceMaps",
+
+	"DEFAULT_BLOOD_VISCOSITY_PA_S",
+	"DEFAULT_INLET_PRESSURE_MMHG",
+	"DEFAULT_OUTLET_PRESSURE_MMHG",
+
+	"build_vessel_geometry",
+	"build_vessel_transport_pipeline",
+	"build_vessel_transport_pipeline_from_image",
+
+	"build_centerline_mask",
+	"build_segment_pixel_map",
+	"build_vessel_mask",
+
+	"summarize_segment_concentrations",
 	"summarize_boundary_sources",
 ]

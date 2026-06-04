@@ -1,47 +1,28 @@
 """
-Smoke test for the real VeSeg vessel-to-transport pipeline.
-
-This checks the full path we care about right now:
-
-1. Run VeSeg on a real vessel image.
-2. Build a VesselNetwork from the skeleton and radius data.
-3. Reconstruct the vessel boundary used for tissue exchange.
-4. Solve a simple pressure-driven flow problem.
-5. Map O2 source / CO2 sink values back onto the vessel boundary.
-6. Plot geometry + transport coupling in one figure.
+Smoke test for the real VeSeg -> Rust vessel transport pipeline.
 """
 
 from pathlib import Path
-from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
-import veseg
 
 from domain.vessel import (
-	FlowSolution,
-	VesselNetwork,
-	assign_flow_weighted_segment_concentrations,
-	build_boundary_source_maps,
-	solve_network_flow_mmhg,
-	summarize_boundary_sources,
-)
-from domain.vessel.coupling import (
+	VesselTransportResult,
 	build_centerline_mask,
-	build_reconstructed_boundary_pixel_map,
+	build_boundary_source_display_maps,
 	build_segment_pixel_map,
 	build_vessel_mask,
+	build_vessel_transport_pipeline_from_image,
+	summarize_boundary_sources as summarize_boundary_source_maps,
+	summarize_segment_concentrations,
 )
-from domain.vessel.geometry import extract_edge_centerlines_from_skeleton
 
 DEFAULT_REAL_IMAGE_PATH = Path("blood_vessel_network_images/structure1.png")
-INLET_PRESSURE_MMHG = 35.0
-OUTLET_PRESSURE_MMHG = 15.0
 
+
+ # Build a hollow outline from a filled vessel mask.
 def build_outline_mask(vessel_mask: np.ndarray) -> np.ndarray:
-	"""
-	Build a hollow outline from a filled vessel mask.
-	"""
 
 	vessel_mask = np.asarray(vessel_mask, dtype=bool)
 	padded = np.pad(vessel_mask, pad_width=1, mode="constant", constant_values=False)
@@ -57,13 +38,12 @@ def build_outline_mask(vessel_mask: np.ndarray) -> np.ndarray:
 
 	return vessel_mask & ~eroded
 
+
+ # Build an RGB debug image with a white outline and red skeleton.
 def build_outline_with_skeleton_image(
 	outline_mask: np.ndarray,
 	skeleton_mask: np.ndarray,
 ) -> np.ndarray:
-	"""
-	Build an RGB debug image with a white outline and red skeleton.
-	"""
 
 	outline_mask = np.asarray(outline_mask, dtype=bool)
 	skeleton_mask = np.asarray(skeleton_mask, dtype=bool)
@@ -74,60 +54,17 @@ def build_outline_with_skeleton_image(
 
 	return image
 
-def build_real_veseg_network(
-	image_path: Path = DEFAULT_REAL_IMAGE_PATH,
-) -> tuple[VesselNetwork, tuple[int, int], np.ndarray, np.ndarray] | None:
-	"""
-	Run VeSeg and convert the result into the simulation vessel representation.
-	"""
 
-	if not image_path.exists():
-		return None
+ # Build the masks used for visual sanity checks.
+def build_debug_masks(result: VesselTransportResult) -> dict[str, np.ndarray]:
 
-	result = veseg.predict(image_path)
-	mask = result.mask if hasattr(result, "mask") else result
-
-	mask, skeleton, distance_map, nodes, edges = veseg.extract_vessel_geometry(mask)
-
-	try:
-		edge_centerlines = extract_edge_centerlines_from_skeleton(
-			skeleton=skeleton,
-			nodes=nodes,
-			edges=edges,
-		)
-	except Exception as error:
-		print("edge centerline tracing failed")
-		print(f"  {error}")
-		print("  falling back to straight interpolated segment centerlines")
-		edge_centerlines = None
-
-	veseg_reconstruction = veseg.reconstruct_vessel_mask(skeleton, distance_map)
-
-	network = VesselNetwork.from_veseg(
-		nodes=nodes,
-		edges=edges,
-		distance_map=distance_map,
-		centerlines=edge_centerlines,
-		min_length_px=0.0,
-		min_radius_px=0.0,
-	)
-
-	return network, mask.shape, skeleton, veseg_reconstruction
-
-def build_debug_masks(
-	network: VesselNetwork,
-	shape: tuple[int, int],
-	veseg_skeleton: np.ndarray,
-	veseg_reconstruction: np.ndarray,
-) -> dict[str, np.ndarray]:
-	"""
-	Build the masks used for visual sanity checks.
-	"""
-
+	geometry = result.geometry
+	network = geometry.network
+	shape = geometry.reconstructed_mask.shape
 	centerline_mask = build_centerline_mask(network, shape)
 	vessel_mask = build_vessel_mask(network, shape)
-	outline_mask = build_outline_mask(veseg_reconstruction)
-	outline_with_skeleton = build_outline_with_skeleton_image(outline_mask, veseg_skeleton)
+	outline_mask = build_outline_mask(geometry.reconstructed_mask)
+	outline_with_skeleton = build_outline_with_skeleton_image(outline_mask, geometry.skeleton)
 	segment_pixel_map = build_segment_pixel_map(network, shape)
 
 	print("Real VeSeg reconstructed mask stats:")
@@ -147,12 +84,43 @@ def build_debug_masks(
 		"outline_with_skeleton": outline_with_skeleton,
 	}
 
-def summarize_network(label: str, network: VesselNetwork) -> None:
-	"""
-	Print basic vessel network stats.
-	"""
 
-	print(f"{label}:")
+ # Build an RGB image showing solved vs ignored vessel regions.
+ # Green segments have solved Rust flow. Red segments were ignored.
+def build_perfused_component_overlay(result: VesselTransportResult) -> np.ndarray:
+
+	geometry = result.geometry
+	shape = geometry.reconstructed_mask.shape
+	segment_pixel_map = build_segment_pixel_map(geometry.network, shape)
+	outline_mask = build_outline_mask(geometry.reconstructed_mask)
+	perfused_segment_ids = set(result.topology.downstream_connections.keys())
+
+	overlay = np.zeros((*shape, 3), dtype=float)
+	overlay[outline_mask] = [1.0, 1.0, 1.0]
+
+	for segment_id, pixels in segment_pixel_map.items():
+		segment_pixels = np.asarray(pixels, dtype=int)
+
+		if segment_pixels.size == 0:
+			continue
+
+		rows = segment_pixels[:, 0]
+		cols = segment_pixels[:, 1]
+
+		if int(segment_id) in perfused_segment_ids:
+			overlay[rows, cols] = [0.0, 1.0, 0.0]
+		else:
+			overlay[rows, cols] = [1.0, 0.0, 0.0]
+
+	return overlay
+
+
+ # Print basic vessel network stats.
+def summarize_network(result: VesselTransportResult) -> None:
+
+	network = result.geometry.network
+
+	print("real VeSeg-built network:")
 	print(f"  nodes: {len(network.nodes)}")
 	print(f"  segments: {len(network.segments)}")
 	print(f"  total length: {network.total_length_um():.2f} µm")
@@ -160,11 +128,10 @@ def summarize_network(label: str, network: VesselNetwork) -> None:
 	print()
 
 
-def summarize_boundary_pixel_map(boundary_pixel_map: dict[int, list[tuple[int, int]]]) -> None:
-	"""
-	Print basic stats for segment-owned exchange boundary pixels.
-	"""
+ # Print basic stats for segment-owned exchange boundary pixels.
+def summarize_boundary_pixel_map(result: VesselTransportResult) -> None:
 
+	boundary_pixel_map = result.boundary_pixel_map
 	mapped_segments = len(boundary_pixel_map)
 	total_boundary_pixels = sum(len(pixels) for pixels in boundary_pixel_map.values())
 
@@ -178,32 +145,24 @@ def summarize_boundary_pixel_map(boundary_pixel_map: dict[int, list[tuple[int, i
 
 	print()
 
-def solve_and_summarize_flow(network: VesselNetwork) -> FlowSolution:
-	"""
-	Solve a quick pressure-driven flow problem for the largest component.
-	"""
 
-	inlet_node, outlet_node, largest_component = network.pressure_boundary_nodes_from_largest_component()
+ # Print basic stats for the Rust flow solve and perfusion topology.
+def summarize_flow(result: VesselTransportResult) -> None:
 
-	flow_solution = solve_network_flow_mmhg(
-		network=network,
-		fixed_pressures_mmhg={
-			inlet_node: INLET_PRESSURE_MMHG,
-			outlet_node: OUTLET_PRESSURE_MMHG,
-		},
-	)
-
+	flow_solution = result.flow_solution
+	topology = result.topology
 	flow_values = np.asarray([
 		abs(flow.flow_um3_per_s)
 		for flow in flow_solution.segment_flows.values()
 	], dtype=float)
 
-	print("Network flow smoke test:")
-	print(f"  largest connected component nodes: {len(largest_component)}")
-	print(f"  inlet node: {inlet_node} ({flow_solution.node_pressure_mmhg(inlet_node):.2f} mmHg)")
-	print(f"  outlet node: {outlet_node} ({flow_solution.node_pressure_mmhg(outlet_node):.2f} mmHg)")
+	print("Rust network flow smoke test:")
 	print(f"  solved node pressures: {len(flow_solution.node_pressures_pa)}")
 	print(f"  solved segment flows: {len(flow_solution.segment_flows)}")
+	print(f"  perfusion inlet nodes: {len(topology.inlet_nodes)}")
+	print(f"  perfusion outlet nodes: {len(topology.outlet_nodes)}")
+	print(f"  perfusion traversal segments: {len(topology.traversal_segments)}")
+	print(f"  downstream connections: {len(topology.downstream_connections)}")
 
 	if flow_values.size:
 		print(f"  min |flow|: {flow_values.min():.4e} µm^3/s")
@@ -211,50 +170,156 @@ def solve_and_summarize_flow(network: VesselNetwork) -> FlowSolution:
 		print(f"  max |flow|: {flow_values.max():.4e} µm^3/s")
 
 	print()
-	return flow_solution
 
-def build_and_summarize_boundary_sources(
-	shape: tuple[int, int],
-	boundary_pixel_map: dict[int, list[tuple[int, int]]],
-	flow_solution: FlowSolution,
-):
-	"""
-	Build the temporary O2 source / CO2 sink maps from solved flow.
-	"""
 
-	# Placeholder chemistry for now. Good enough to check that vessel values
-	# actually land on the reconstructed tissue boundary.
-	segment_concentrations = assign_flow_weighted_segment_concentrations(
-		flow_solution=flow_solution,
-		inlet_oxygen=1.0,
-		inlet_carbon_dioxide=0.0,
+
+ # Print stats for the O2 source / CO2 sink maps.
+def summarize_boundary_sources(result: VesselTransportResult) -> None:
+
+	summary = summarize_boundary_source_maps(result.boundary_sources)
+	segment_summary = summarize_segment_concentrations(
+		result.segment_concentrations,
 	)
-
-	boundary_sources = build_boundary_source_maps(
-		shape=shape,
-		boundary_pixel_map=boundary_pixel_map,
-		segment_concentrations=segment_concentrations,
-	)
-
-	summary = summarize_boundary_sources(boundary_sources)
 
 	print("Boundary transport source maps:")
-	print(f"  segment concentrations: {len(segment_concentrations)}")
+	print(f"  segment concentrations: {len(result.segment_concentrations)}")
+	print(f"  oxygen concentration min: {segment_summary['oxygen_min']:.4f}")
+	print(f"  oxygen concentration mean: {segment_summary['oxygen_mean']:.4f}")
+	print(f"  oxygen concentration max: {segment_summary['oxygen_max']:.4f}")
+	print(f"  oxygen pixels: {summary['oxygen_pixels']:.0f}")
 	print(f"  oxygen total source: {summary['oxygen_total']:.4e}")
+	print(f"  oxygen min nonzero source: {summary['oxygen_min_nonzero']:.4e}")
 	print(f"  oxygen max pixel source: {summary['oxygen_max']:.4e}")
 	print(f"  carbon dioxide total sink: {summary['carbon_dioxide_total']:.4e}")
 	print(f"  carbon dioxide max pixel sink: {summary['carbon_dioxide_max']:.4e}")
 	print()
 
-	return boundary_sources
+
+# Draw pressure and flow-direction diagnostics into the main vessel figure.
+def plot_flow_direction_map(result: VesselTransportResult, pressure_axis, direction_axis, fig) -> None:
+
+	network = result.geometry.network
+	flow_solution = result.flow_solution
+	outline_mask = build_outline_mask(result.geometry.reconstructed_mask)
+	pressure_values = np.asarray(list(flow_solution.node_pressures_pa.values()), dtype=float)
+	flow_values = np.asarray([
+		abs(flow.flow_um3_per_s)
+		for flow in flow_solution.segment_flows.values()
+	], dtype=float)
+	min_pressure = pressure_values.min() if pressure_values.size else 0.0
+	max_pressure = pressure_values.max() if pressure_values.size else 1.0
+	max_flow = flow_values.max() if flow_values.size else 1.0
+
+	pressure_axis.imshow(outline_mask, cmap="gray")
+	pressure_axis.set_title("Pressure Map: Yellow = High, Purple = Low")
+	direction_axis.imshow(outline_mask, cmap="gray")
+	direction_axis.set_title("Flow Direction: Red Arrows")
+
+	for segment_id, segment in network.segments.items():
+		connection = result.topology.downstream_connections.get(segment_id)
+
+		if connection is None:
+			continue
+
+		if abs(connection.flow_um3_per_s) <= 0.0:
+			print(
+				f"segment {segment_id} has topology but zero flow "
+				f"({connection.from_node} -> {connection.to_node})"
+			)
+
+		start_pressure = flow_solution.node_pressures_pa.get(connection.from_node)
+		end_pressure = flow_solution.node_pressures_pa.get(connection.to_node)
+
+		if start_pressure is None or end_pressure is None:
+			continue
+
+		centerline = orient_centerline(segment, connection.from_node, connection.to_node)
+
+		if len(centerline) < 2:
+			continue
+
+		pressure = 0.5 * (start_pressure + end_pressure)
+		pressure_scale = (pressure - min_pressure) / max(max_pressure - min_pressure, 1.0e-12)
+		flow_scale = abs(connection.flow_um3_per_s) / max(max_flow, 1.0e-12)
+		rows = np.asarray([point[0] for point in centerline], dtype=float)
+		cols = np.asarray([point[1] for point in centerline], dtype=float)
+		pressure_axis.plot(
+			cols,
+			rows,
+			linewidth=1.0 + 2.0 * flow_scale,
+			color=plt.cm.viridis(pressure_scale),
+		)
+		direction_axis.plot(
+			cols,
+			rows,
+			linewidth=0.75,
+			color="white",
+			alpha=0.45,
+		)
+		draw_flow_arrow(direction_axis, centerline)
+
+	pressure_image = pressure_axis.imshow(
+		np.full_like(result.geometry.reconstructed_mask, np.nan, dtype=float),
+		cmap="viridis",
+		vmin=min_pressure,
+		vmax=max_pressure,
+	)
+	fig.colorbar(
+		pressure_image,
+		ax=pressure_axis,
+		fraction=0.046,
+		pad=0.04,
+		label="Pressure (mmHg)",
+	)
+
+
+# Orient a centerline so arrows use perfusion topology direction.
+def orient_centerline(segment, from_node: int, to_node: int):
+
+	centerline = segment.centerline
+
+	if segment.start_node == from_node and segment.end_node == to_node:
+		return centerline
+
+	if segment.start_node == to_node and segment.end_node == from_node:
+		return list(reversed(centerline))
+
+	return centerline
+
+
+# Draw one same-sized arrow along the middle of a segment centerline.
+def draw_flow_arrow(axis, centerline):
+
+	arrow_distance = max(8, len(centerline) // 7)
+	mid_index = len(centerline) // 2
+	start_index = max(0, mid_index - arrow_distance)
+	end_index = min(len(centerline) - 1, mid_index + arrow_distance)
+	start_row, start_col = centerline[start_index]
+	end_row, end_col = centerline[end_index]
+
+	axis.annotate(
+		"",
+		xy=(end_col, end_row),
+		xytext=(start_col, start_row),
+		arrowprops={
+			"arrowstyle": "-|>",
+			"linewidth": 1.4,
+			"color": "red",
+			"mutation_scale": 14.0,
+			"shrinkA": 0.0,
+			"shrinkB": 0.0,
+		},
+	)
+
+
+
 
 # Pure visualization. None of this belongs in the actual simulation loop.
-def plot_combined_results(mask_set: dict[str, np.ndarray], boundary_sources) -> None:
-	"""
-	Plot geometry, flow-derived sources, and the final coupling overlay.
-	"""
+def plot_combined_results(mask_set: dict[str, np.ndarray], result: VesselTransportResult) -> None:
 
-	fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+	boundary_sources = result.boundary_sources
+	oxygen_display, carbon_dioxide_display = build_boundary_source_display_maps(result)
+	fig, axes = plt.subplots(2, 5, figsize=(22, 8))
 
 	axes[0, 0].imshow(mask_set["centerline"], cmap="gray")
 	axes[0, 0].set_title("Real VeSeg Centerline")
@@ -265,12 +330,15 @@ def plot_combined_results(mask_set: dict[str, np.ndarray], boundary_sources) -> 
 	axes[0, 2].imshow(mask_set["outline_with_skeleton"])
 	axes[0, 2].set_title("Reconstructed Outline + Skeleton")
 
-	oxygen_image = axes[1, 0].imshow(boundary_sources.oxygen, cmap="viridis", vmin=0.0, vmax=1.0)
+	axes[0, 3].imshow(build_perfused_component_overlay(result))
+	axes[0, 3].set_title("Perfusion Topology: Green = Used, Red = Ignored")
+
+	oxygen_image = axes[1, 0].imshow(oxygen_display, cmap="viridis", vmin=0.0, vmax=1.0)
 	axes[1, 0].set_title("Oxygen Boundary Source")
 	fig.colorbar(oxygen_image, ax=axes[1, 0], fraction=0.046, pad=0.04)
 
 	carbon_dioxide_image = axes[1, 1].imshow(
-		boundary_sources.carbon_dioxide,
+		carbon_dioxide_display,
 		cmap="coolwarm",
 		vmin=-1.0,
 		vmax=1.0,
@@ -279,8 +347,14 @@ def plot_combined_results(mask_set: dict[str, np.ndarray], boundary_sources) -> 
 	fig.colorbar(carbon_dioxide_image, ax=axes[1, 1], fraction=0.046, pad=0.04)
 
 	axes[1, 2].imshow(mask_set["outline_with_skeleton"])
-	axes[1, 2].imshow(boundary_sources.oxygen, cmap="viridis", vmin=0.0, vmax=1.0, alpha=0.75)
+	axes[1, 2].imshow(oxygen_display, cmap="viridis", vmin=0.0, vmax=1.0, alpha=0.75)
 	axes[1, 2].set_title("Oxygen Source Overlay")
+
+	axes[1, 3].imshow(mask_set["outline_with_skeleton"])
+	axes[1, 3].imshow(carbon_dioxide_display, cmap="coolwarm", vmin=-1.0, vmax=1.0, alpha=0.75)
+	axes[1, 3].set_title("CO2 Sink Overlay")
+
+	plot_flow_direction_map(result, axes[0, 4], axes[1, 4], fig)
 
 	for axis in axes.flat:
 		axis.set_axis_off()
@@ -288,43 +362,22 @@ def plot_combined_results(mask_set: dict[str, np.ndarray], boundary_sources) -> 
 	plt.tight_layout()
 	plt.show()
 
+
 def main() -> None:
-	"""
-	Run the full real-image vessel coupling smoke test.
-	"""
 
-	real_result = build_real_veseg_network()
-
-	if real_result is None:
+	if not DEFAULT_REAL_IMAGE_PATH.exists():
 		print(f"missing image: {DEFAULT_REAL_IMAGE_PATH}")
 		return
 
-	real_network, real_shape, veseg_skeleton, veseg_reconstruction = real_result
-	summarize_network("real VeSeg-built network", real_network)
+	result = build_vessel_transport_pipeline_from_image(DEFAULT_REAL_IMAGE_PATH)
 
-	mask_set = build_debug_masks(
-		real_network,
-		real_shape,
-		veseg_skeleton,
-		veseg_reconstruction,
-	)
+	summarize_network(result)
+	mask_set = build_debug_masks(result)
+	summarize_boundary_pixel_map(result)
+	summarize_flow(result)
+	summarize_boundary_sources(result)
+	plot_combined_results(mask_set, result)
 
-	# Geometry-only work. The real simulation should cache this once.
-	boundary_pixel_map = build_reconstructed_boundary_pixel_map(
-		network=real_network,
-		reconstructed_vessel_mask=veseg_reconstruction,
-	)
-	summarize_boundary_pixel_map(boundary_pixel_map)
-
-	# Flow is static unless geometry, pressure, or vessel radii change.
-	flow_solution = solve_and_summarize_flow(real_network)
-	boundary_sources = build_and_summarize_boundary_sources(
-		shape=real_shape,
-		boundary_pixel_map=boundary_pixel_map,
-		flow_solution=flow_solution,
-	)
-
-	plot_combined_results(mask_set, boundary_sources)
 
 if __name__ == "__main__":
 	main()

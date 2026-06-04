@@ -1,13 +1,11 @@
-from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
-from matplotlib.collections import LineCollection
 from tqdm import tqdm
 import numpy as np
 import gpu_solver
 from domain import TissueDomain
+from domain.vessel import build_vessel_transport_pipeline_from_image
 from species import Oxygen
-import veseg
 
 
 # Convert arrays into a format that the Rust/PyO3 interface can accept safely.
@@ -16,179 +14,27 @@ def _rust_array(value, dtype):
 	return np.ascontiguousarray(np.asarray(value, dtype=dtype))
 
 
-# Scale graph node coordinates and edge length/radius values into the simulation grid.
-def scale_vessel_geometry(nodes, edges, source_shape, target_shape):
-	"""Scale VeSeg graph geometry from segmentation pixels into simulation pixels."""
-	source_h, source_w = source_shape
-	target_h, target_w = target_shape
+# Normalize a field for visualization only.
+def normalize_display_field(values):
+	"""Normalize a copy of a concentration field without changing the simulation state."""
+	values = np.asarray(values, dtype=np.float32)
+	min_value = float(np.min(values))
+	max_value = float(np.max(values))
 
-	row_scale = target_h / source_h
-	col_scale = target_w / source_w
-	radius_scale = 0.5 * (row_scale + col_scale)
+	if np.isclose(max_value, min_value):
+		return np.zeros_like(values, dtype=np.float32)
 
-	scaled_nodes = np.array(nodes, dtype=np.float32, copy=True)
-	scaled_edges = np.array(edges, dtype=np.float32, copy=True)
-
-	# Node table columns: [node_id, row, col, node_type].
-	if scaled_nodes.size > 0:
-		scaled_nodes[:, 1] *= row_scale
-		scaled_nodes[:, 2] *= col_scale
-
-	# Edge table columns:
-	# [edge_id, start_node, end_node, length_px, mean_radius, min_radius, max_radius, normalized_radius].
-	if scaled_edges.size > 0:
-		scaled_edges[:, 3] *= radius_scale
-		scaled_edges[:, 4] *= radius_scale
-		scaled_edges[:, 5] *= radius_scale
-		scaled_edges[:, 6] *= radius_scale
-
-	return scaled_nodes, scaled_edges
-
-
-# Save VeSeg geometry outputs so later flow/transport code can reuse them directly.
-def save_vessel_geometry(output_path, raw_mask, skeleton, distance_map, reconstructed_mask, scaled_skeleton, scaled_distance_map, scaled_reconstructed_mask, simulation_mask, nodes, edges, scaled_nodes, scaled_edges):
-	"""Save raw and simulation-scaled vessel geometry arrays to one compressed file."""
-	output_path = Path(output_path)
-	output_path.parent.mkdir(parents=True, exist_ok=True)
-
-	np.savez_compressed(
-		output_path,
-		raw_mask=raw_mask.astype(bool),
-		skeleton=skeleton.astype(bool),
-		distance_map=distance_map.astype(np.float32),
-		reconstructed_mask=reconstructed_mask.astype(bool),
-		scaled_skeleton=scaled_skeleton.astype(bool),
-		scaled_distance_map=scaled_distance_map.astype(np.float32),
-		scaled_reconstructed_mask=scaled_reconstructed_mask.astype(bool),
-		simulation_mask=simulation_mask.astype(bool),
-		nodes=nodes.astype(np.float32),
-		edges=edges.astype(np.float32),
-		scaled_nodes=scaled_nodes.astype(np.float32),
-		scaled_edges=scaled_edges.astype(np.float32),
-	)
-
-
-# Crop or pad a scaled mask so it exactly matches the simulation domain shape.
-def fit_mask_to_shape(mask, target_shape):
-	"""Fit a binary mask to the target simulation shape without resampling again."""
-	target_h, target_w = target_shape
-	fitted = np.zeros(target_shape, dtype=bool)
-
-	copy_h = min(mask.shape[0], target_h)
-	copy_w = min(mask.shape[1], target_w)
-
-	fitted[:copy_h, :copy_w] = mask[:copy_h, :copy_w]
-	return fitted
-
-
-# Scale the centerline/radius representation first, then reconstruct at simulation resolution.
-def scale_skeleton_distance_for_reconstruction(skeleton, distance_map, source_shape, target_shape):
-	"""Scale VeSeg skeleton + radius data before reconstruction to avoid blocky mask scaling."""
-	source_h, source_w = source_shape
-	target_h, target_w = target_shape
-
-	row_scale = target_h / source_h
-	col_scale = target_w / source_w
-	radius_scale = 0.5 * (row_scale + col_scale)
-
-	scaled_skeleton = np.zeros(target_shape, dtype=bool)
-	scaled_distance_map = np.zeros(target_shape, dtype=np.float32)
-
-	rows, cols = np.nonzero(skeleton)
-
-	for row, col in zip(rows, cols):
-		target_row = min(int(round(row * row_scale)), target_h - 1)
-		target_col = min(int(round(col * col_scale)), target_w - 1)
-
-		scaled_skeleton[target_row, target_col] = True
-		scaled_distance_map[target_row, target_col] = max(
-			scaled_distance_map[target_row, target_col],
-			float(distance_map[row, col]) * radius_scale,
-		)
-
-	return scaled_skeleton, scaled_distance_map
-
-
-# Plot the extracted vessel graph, with each edge colored by mean radius.
-def plot_radius_colored_graph(nodes, edges, vessel_mask):
-	"""Render the scaled vessel graph and color edges by mean radius."""
-	fig, ax = plt.subplots(1, 1, figsize=(7, 7))
-	ax.imshow(vessel_mask, cmap="gray", alpha=0.18)
-
-	if nodes.size == 0 or edges.size == 0:
-		ax.set_title("Vessel graph + radii | no graph data")
-		ax.axis("off")
-		plt.close(fig)
-		return
-
-	# Node table columns: [node_id, row, col, node_type].
-	node_lookup = {
-		int(node[0]): (float(node[2]), float(node[1]))
-		for node in nodes
-	}
-
-	segments = []
-	radii = []
-	line_widths = []
-
-	for edge in edges:
-		start_id = int(edge[1])
-		end_id = int(edge[2])
-
-		if start_id not in node_lookup or end_id not in node_lookup:
-			continue
-
-		mean_radius = float(edge[4])
-		segments.append([node_lookup[start_id], node_lookup[end_id]])
-		radii.append(mean_radius)
-		line_widths.append(max(1.0, 0.35 * mean_radius))
-
-	if not segments:
-		ax.set_title("Vessel graph + radii | no drawable edges")
-		ax.axis("off")
-		plt.close(fig)
-		return
-
-	collection = LineCollection(
-		segments,
-		array=np.asarray(radii, dtype=np.float32),
-		cmap="viridis",
-		linewidths=line_widths,
-		alpha=0.95,
-	)
-
-	ax.add_collection(collection)
-	ax.scatter(
-		nodes[:, 2],
-		nodes[:, 1],
-		s=8,
-		c="black",
-		alpha=0.75,
-		label="Graph nodes",
-	)
-
-	colorbar = fig.colorbar(collection, ax=ax, fraction=0.046, pad=0.04)
-	colorbar.set_label("Mean vessel radius (simulation pixels)")
-
-	ax.set_title("Structure 3 vessel graph colored by radius")
-	ax.set_xlim(0, vessel_mask.shape[1])
-	ax.set_ylim(vessel_mask.shape[0], 0)
-	ax.set_aspect("equal")
-	ax.axis("off")
+	return np.clip((values - min_value) / (max_value - min_value), 0.0, 1.0)
 
 
 # Combine oxygen, carbon dioxide, anoxia, and vessels into one RGBA frame.
 def make_overlay_frame(o2, co2, vessel_mask, anoxic_threshold=0.2):
-	"""Render O2, CO2, anoxic regions, and vessels as one transparent overlay."""
+	"""Render O2, CO2, anoxic regions, and reconstructed vessels."""
 	frame = np.zeros((*o2.shape, 4), dtype=np.float32)
 
-	# Fixed normalization: O2 = 0.0→1.0 mapped to dark→bright orange.
-	o2_norm = o2 / 1.0
-	# Fixed normalization: CO2 = 0.0→0.5 mapped to dark→bright cyan.
-	co2_norm = co2 / 0.5
-
-	o2_norm = np.clip(o2_norm, 0.0, 1.0)
-	co2_norm = np.clip(co2_norm, 0.0, 1.0)
+	# Normalize only the rendered frame. The real O2/CO2 arrays stay untouched.
+	o2_norm = normalize_display_field(o2)
+	co2_norm = normalize_display_field(co2)
 
 	# Oxygen uses a stronger warm perfusion-style orange/red gradient.
 	frame[..., 0] += 1.0 * o2_norm
@@ -208,39 +54,70 @@ def make_overlay_frame(o2, co2, vessel_mask, anoxic_threshold=0.2):
 	anoxic_norm = np.clip(
 		(anoxic_threshold - o2) / anoxic_threshold,
 		0.0,
-		1.0
+		1.0,
 	)
 
 	frame[..., 0] *= (1.0 - 0.7 * anoxic_norm)
 	frame[..., 1] *= (1.0 - 0.7 * anoxic_norm)
 	frame[..., 2] *= (1.0 - 0.7 * anoxic_norm)
 	frame[..., 3] += 0.75 * anoxic_norm
-
 	frame = np.clip(frame, 0.0, 1.0)
 
-	# Deep blood red for vessels.
+	# Draw the reconstructed vessel geometry in solid red.
 	frame[vessel_mask] = [0.45, 0.0, 0.0, 1.0]
 
 	return frame
 
 
+# Show exactly which source/sink maps are being passed into the solver.
+def plot_solver_source_sink_maps(oxygen_source_map, carbon_dioxide_sink_map, structure_name):
+	"""Debug plot for the actual O2 source and CO2 sink maps used by main.py."""
+	fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+	oxygen_image = axes[0].imshow(
+		oxygen_source_map,
+		cmap="viridis",
+		vmin=0.0,
+		vmax=1.0,
+	)
+	axes[0].set_title(f"{structure_name} O2 Source Map Used")
+	axes[0].set_axis_off()
+	fig.colorbar(oxygen_image, ax=axes[0], fraction=0.046, pad=0.04)
+
+	carbon_dioxide_image = axes[1].imshow(
+		carbon_dioxide_sink_map,
+		cmap="coolwarm",
+		vmin=-1.0,
+		vmax=1.0,
+	)
+	axes[1].set_title(f"{structure_name} CO2 Sink Map Used")
+	axes[1].set_axis_off()
+	fig.colorbar(carbon_dioxide_image, ax=axes[1], fraction=0.046, pad=0.04)
+
+	plt.tight_layout()
+	plt.show(block=False)
+
+
 # Prepare simulation arrays that do not change during a run.
-def prepare_rust_solver_arrays(domain, species):
+def prepare_rust_solver_arrays(domain, species, oxygen_source_map, carbon_dioxide_sink_map):
 	"""Prepare static NumPy arrays for the Rust GPU solver once."""
+	vessel_source_mask = oxygen_source_map > 0.0
+
 	return {
 		"diffusivity": _rust_array(
 			species.effective_diffusivity_grid(
 				domain.temperature,
 				domain.mu,
 				domain.epsilon,
-				domain.tau
+				domain.tau,
 			),
-			np.float32
+			np.float32,
 		),
 		"vmax": _rust_array(domain.consumption_vmax, np.float32),
 		"km": _rust_array(domain.consumption_km, np.float32),
-		"vessel_mask": _rust_array(domain.vessel_mask, bool),
-		"vessel_concentration": _rust_array(domain.vessel_concentration, np.float32),
+		"vessel_mask": _rust_array(vessel_source_mask, bool),
+		"vessel_concentration": _rust_array(oxygen_source_map, np.float32),
+		"vessel_carbon_dioxide": _rust_array(carbon_dioxide_sink_map, np.float32),
 		"carbon_dioxide": np.zeros_like(domain.concentration, dtype=np.float32),
 		"dx": domain.dx,
 		"dy": domain.dy,
@@ -259,7 +136,7 @@ def rust_reaction_diffusion_steps(concentration, arrays, steps, dt):
 		arrays["km"],
 		arrays["vessel_mask"],
 		arrays["vessel_concentration"],
-		np.zeros_like(arrays["vessel_concentration"], dtype=np.float32),
+		arrays["vessel_carbon_dioxide"],
 		arrays["dx"],
 		arrays["dy"],
 		dt,
@@ -271,97 +148,64 @@ def rust_reaction_diffusion_steps(concentration, arrays, steps, dt):
 
 # Build one tissue domain from one vessel structure image.
 def create_domain_from_structure(structure_path, structure_name, shape, scale):
-	"""Create a tissue domain, vessel mask, and saved VeSeg graph geometry."""
+	"""Create a tissue domain and reconstructed flow-weighted source/sink maps."""
 	domain = TissueDomain(shape, scale)
 	domain.set_uniform_properties(epsilon=0.3, tau=2.0, mu=0.001)
 	domain.set_initial_concentration(0.0)
 
-	veseg_result = veseg.predict(
-		path=structure_path,
-		mode=veseg.ENHANCED_INVERTED,
+	transport_result = build_vessel_transport_pipeline_from_image(
+		image_path=structure_path,
+		shape=shape,
 	)
 
-	# Start with VeSeg's postprocessed prediction mask.
-	raw_mask = veseg_result.despeckle(min_neighbors=2).mask.astype(bool)
-
-	# Extract reusable graph geometry at the native VeSeg mask resolution.
-	geometry_mask, skeleton, distance_map, nodes, edges = veseg.extract_vessel_geometry(raw_mask)
-
-	# Keep the native-resolution reconstruction for saved geometry/debugging.
-	reconstructed_mask = veseg.reconstruct_vessel_mask(skeleton, distance_map).astype(bool)
-
-	# For the simulation mask, scale the centerline + radius data first and reconstruct at
-	# simulation resolution. This avoids magnifying a low-resolution binary mask, which is
-	# what makes vessels look blocky.
-	scaled_skeleton, scaled_distance_map = scale_skeleton_distance_for_reconstruction(
-		skeleton,
-		distance_map,
-		source_shape=geometry_mask.shape,
-		target_shape=shape,
-	)
-
-	scaled_reconstructed_mask = veseg.reconstruct_vessel_mask(
-		scaled_skeleton,
-		scaled_distance_map,
-	).astype(bool)
-
-	simulation_mask = fit_mask_to_shape(
-		scaled_reconstructed_mask,
-		shape,
-	)
-
-	# Scale node coordinates and edge length/radius columns into simulation-pixel units.
-	scaled_nodes, scaled_edges = scale_vessel_geometry(
-		nodes,
-		edges,
-		source_shape=geometry_mask.shape,
-		target_shape=shape,
-	)
-
-	safe_name = structure_name.lower().replace(" ", "_")
-	save_vessel_geometry(
-		Path("vessel_geometry") / f"{safe_name}_geometry.npz",
-		geometry_mask,
-		skeleton,
-		distance_map,
-		reconstructed_mask,
-		scaled_skeleton,
-		scaled_distance_map,
-		scaled_reconstructed_mask,
-		simulation_mask,
-		nodes,
-		edges,
-		scaled_nodes,
-		scaled_edges,
-	)
-
-	domain.set_vessel_mask(simulation_mask, 1.0)
+	boundary_sources = transport_result.boundary_sources
+	oxygen_source_map = boundary_sources.oxygen
+	# The tissue solver now interprets the vessel CO2 map as a source/sink term.
+	# Negative values remove CO2 from vessel cells instead of pinning CO2 to a
+	# fixed boundary concentration.
+	carbon_dioxide_sink_map = -np.abs(boundary_sources.carbon_dioxide)
+	vessel_mask = transport_result.geometry.reconstructed_mask.astype(bool)
+	domain.set_vessel_mask(vessel_mask, 1.0)
 	domain.set_uniform_consumption(vmax=0.05, km=0.05)
 
-	return domain, simulation_mask, scaled_nodes, scaled_edges
+	print(f"{structure_name}: vessel transport pipeline")
+	print(f"  nodes: {len(transport_result.geometry.network.nodes)}")
+	print(f"  segments: {len(transport_result.geometry.network.segments)}")
+	print(f"  raw centerline source pixels: {int(np.count_nonzero(boundary_sources.oxygen))}")
+	print(f"  raw centerline sink pixels: {int(np.count_nonzero(boundary_sources.carbon_dioxide))}")
+	print(f"  reconstructed source pixels: {int(np.count_nonzero(oxygen_source_map))}")
+	print(f"  reconstructed sink pixels: {int(np.count_nonzero(boundary_sources.carbon_dioxide))}")
+	print(f"  CO2 vessel sink pixels: {int(np.count_nonzero(carbon_dioxide_sink_map))}")
+	print()
+
+	return domain, vessel_mask, oxygen_source_map, carbon_dioxide_sink_map
 
 
 # Run one full gas-exchange simulation for one vessel structure.
 def run_structure_simulation(structure_path, structure_name, ax, shape, scale, oxygen):
 	"""Run one simulation and draw the final composite frame on one axis."""
-	domain, mask, nodes, edges = create_domain_from_structure(
+	domain, vessel_mask, oxygen_source_map, carbon_dioxide_sink_map = create_domain_from_structure(
 		structure_path,
 		structure_name,
 		shape,
-		scale
+		scale,
 	)
-	print(f"{structure_name}: saved {nodes.shape[0]} nodes and {edges.shape[0]} radius-annotated edges")
-	plot_radius_colored_graph(
-		nodes,
-		edges,
-		mask
+	plot_solver_source_sink_maps(
+		oxygen_source_map,
+		carbon_dioxide_sink_map,
+		structure_name,
 	)
-	rust_arrays = prepare_rust_solver_arrays(domain, oxygen)
+	rust_arrays = prepare_rust_solver_arrays(
+		domain,
+		oxygen,
+		oxygen_source_map=oxygen_source_map,
+		carbon_dioxide_sink_map=carbon_dioxide_sink_map,
+	)
 
 	visual_frame = make_overlay_frame(
 		domain.concentration,
 		np.zeros_like(domain.concentration),
-		mask
+		vessel_mask,
 	)
 	composite_plot = ax.imshow(visual_frame)
 	ax.set_title(f"{structure_name} | step 0")
@@ -369,13 +213,13 @@ def run_structure_simulation(structure_path, structure_name, ax, shape, scale, o
 
 	for step in tqdm(
 		range(frame_interval_steps, total_steps + 1, frame_interval_steps),
-		desc=structure_name
+		desc=structure_name,
 	):
 		o2, co2 = rust_reaction_diffusion_steps(
 			domain.concentration,
 			rust_arrays,
 			steps=frame_interval_steps,
-			dt=simulation_dt
+			dt=simulation_dt,
 		)
 
 		domain.concentration = o2
@@ -384,7 +228,7 @@ def run_structure_simulation(structure_path, structure_name, ax, shape, scale, o
 		visual_frame = make_overlay_frame(
 			domain.concentration,
 			rust_arrays["carbon_dioxide"],
-			mask
+			vessel_mask,
 		)
 		composite_plot.set_data(visual_frame)
 		ax.set_title(f"{structure_name} | step {step}")
@@ -405,12 +249,11 @@ frame_interval_steps = max(1, total_steps // target_frames)
 oxygen = Oxygen()
 
 structures = [
-	("blood_vessel_network_images/structure3.png", "Structure 3"),
+	("blood_vessel_network_images/structure1.png", "Structure 1"),
 ]
 
 plt.ion()
 
-# Draw only Structure 3 for the current VeSeg geometry workflow.
 fig, ax = plt.subplots(1, 1, figsize=(7, 7))
 fig.suptitle(f"Gas exchange simulation | dt = {simulation_dt}", fontsize=14)
 
@@ -421,26 +264,26 @@ run_structure_simulation(
 	ax,
 	shape,
 	scale,
-	oxygen
+	oxygen,
 )
 
 legend_elements = [
 	Patch(
 		facecolor=(1.0, 0.55, 0.10),
-		label="O₂ concentration (0 → 1.0, dark → bright)"
+		label="O₂ concentration (frame-normalized, dark → bright)",
 	),
 	Patch(
 		facecolor=(0.0, 0.8, 1.0),
-		label="CO₂ concentration (0 → 0.5, dark → bright)"
+		label="CO₂ concentration (frame-normalized, dark → bright)",
 	),
 	Patch(
 		facecolor=(0.05, 0.05, 0.05),
-		label="Anoxic gradient (O₂ < 0.2, more opaque = lower O₂)"
+		label="Anoxic gradient (O₂ < 0.2, more opaque = lower O₂)",
 	),
 	Patch(
 		facecolor=(0.45, 0.0, 0.0),
-		label="Blood vessels (fixed O₂ source)"
-	)
+		label="Reconstructed vessel geometry",
+	),
 ]
 
 fig.legend(
@@ -459,13 +302,7 @@ plt.subplots_adjust(
 	right=0.97,
 	bottom=0.23,
 	top=0.88,
-	wspace=0.03
-)
-
-fig.savefig(
-	"gas_exchange_structure3.png",
-	dpi=300,
-	bbox_inches="tight"
+	wspace=0.03,
 )
 
 plt.show(block=True)

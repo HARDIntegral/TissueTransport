@@ -1,0 +1,11 @@
+[workspace]
+members = [
+	"tissue_solver",
+	"vessel_solver",
+]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
